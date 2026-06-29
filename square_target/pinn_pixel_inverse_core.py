@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import json
@@ -62,7 +62,10 @@ class TrainConfig:
     n_boundary: int = 512
     n_tv_grid: int = 48
     epochs_adam: int = 10000
-    epochs_lbfgs: int = 20000
+    epochs_lbfgs: int = 0
+    lbfgs_steps: int = 0
+    lbfgs_lr: float = 1.0
+    lbfgs_max_iter: int = 20
     lbfgs_history_size: int = 50
     learning_rate: float = 1.0e-3
     # epochs_adam: int = 30000
@@ -74,6 +77,13 @@ class TrainConfig:
     weight_tv: float = 0.025
     weight_contrast_l1: float = 1.0e-3
     robust_data_weighting: bool = True
+    loss_preset: str = "current"
+    lambda_f: float = 1.0
+    lambda_d: float = 100.0
+    lambda_ep: float = 100.0
+    adaptive_gamma: float = 1.0
+    adaptive_delta: float = 1.0e-8
+    edge_delta: float = 1.0e-3
     gradient_clip_norm: float = 1.0
     field_hidden_layers: int = 6
     field_hidden_units: int = 96
@@ -612,6 +622,22 @@ def data_loss(
     return torch.mean(torch.sum(diff.square(), dim=1, keepdim=True))
 
 
+def paper_weighted_data_loss(
+    model: DoubleBranchPINN,
+    xy: "torch.Tensor",
+    directions: "torch.Tensor",
+    target: "torch.Tensor",
+    gamma: float,
+    delta: float,
+) -> "torch.Tensor":
+    pred = model.scattered_field(xy, directions)
+    diff = pred - target
+    residual_mag = torch.sqrt(torch.sum(diff.square(), dim=1, keepdim=True) + 1e-12)
+    r_bar = torch.mean(residual_mag)
+    weights = 1.0 / (1.0 + gamma * residual_mag / (r_bar + delta))
+    return torch.mean(weights * residual_mag.square())
+
+
 def total_variation_loss(
     model: DoubleBranchPINN,
     target: TargetSpec,
@@ -632,6 +658,26 @@ def total_variation_loss(
     return torch.mean(torch.sqrt(dx.square() + beta.square())) + torch.mean(
         torch.sqrt(dy.square() + beta.square())
     )
+
+
+def edge_preserving_loss(
+    model: DoubleBranchPINN,
+    target: TargetSpec,
+    n_grid: int,
+    device: "torch.device",
+    dtype: "torch.dtype",
+    edge_delta: float,
+) -> "torch.Tensor":
+    if n_grid <= 1:
+        return torch.zeros((), dtype=dtype, device=device)
+    xs = torch.linspace(-target.roi_half_width, target.roi_half_width, n_grid, device=device, dtype=dtype)
+    ys = torch.linspace(-target.roi_half_width, target.roi_half_width, n_grid, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    xy = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1).detach().clone().requires_grad_(True)
+    eps = model.epsilon(xy)
+    grad_eps = torch.autograd.grad(eps.sum(), xy, create_graph=True, retain_graph=True)[0]
+    delta = torch.as_tensor(edge_delta, dtype=dtype, device=device)
+    return torch.mean(torch.sqrt(grad_eps[:, 0:1].square() + grad_eps[:, 1:2].square() + delta.square()))
 
 
 def contrast_l1_loss(
@@ -927,6 +973,9 @@ EVALUATION_FIELDNAMES = [
     "pde_loss",
     "boundary_loss",
     "tv_loss",
+    "lf_loss",
+    "ldw_loss",
+    "lep_loss",
     "rel_error_continuous",
     "ssim_continuous",
     "rel_error_thresholded",
@@ -949,6 +998,9 @@ def make_evaluation_row(
         "pde_loss": float(loss_items.get("pde", float("nan"))),
         "boundary_loss": float(loss_items.get("boundary", float("nan"))),
         "tv_loss": float(loss_items.get("tv", float("nan"))),
+        "lf_loss": float(loss_items.get("lf", float("nan"))),
+        "ldw_loss": float(loss_items.get("ldw", float("nan"))),
+        "lep_loss": float(loss_items.get("lep", float("nan"))),
         "rel_error_continuous": float(metrics["rel_error_continuous"]),
         "ssim_continuous": float(metrics["ssim_continuous"]),
         "rel_error_thresholded": float(metrics["rel_error_thresholded"]),
@@ -1111,6 +1163,73 @@ def save_torch_file(payload: dict, path: Path) -> None:
         torch.save(payload, f)
 
 
+def compute_loss_terms(
+    model: DoubleBranchPINN,
+    *,
+    data_xy: "torch.Tensor",
+    data_dirs: "torch.Tensor",
+    data_target: "torch.Tensor",
+    data_indices: "torch.Tensor",
+    pde_xy: "torch.Tensor",
+    pde_dirs: "torch.Tensor",
+    pde_amps: "torch.Tensor",
+    bc_xy: "torch.Tensor",
+    bc_dirs: "torch.Tensor",
+    integral_tensors: Optional[IntegralTensors],
+    obs_tensors: ObservationTensors,
+    target: TargetSpec,
+    config: TrainConfig,
+    device: "torch.device",
+    dtype: "torch.dtype",
+) -> Dict[str, "torch.Tensor"]:
+    loss_data = data_loss(model, data_xy, data_dirs, data_target, robust=config.robust_data_weighting)
+    loss_pde = pde_residual_loss(model, pde_xy, pde_dirs, pde_amps, config)
+    loss_boundary = sommerfeld_boundary_loss(model, bc_xy, bc_dirs, config)
+    if integral_tensors is None:
+        loss_integral = torch.zeros((), dtype=dtype, device=device)
+    else:
+        loss_integral = volume_integral_data_loss(
+            model, data_indices, data_dirs, data_target, integral_tensors, obs_tensors, target, config
+        )
+    loss_tv = total_variation_loss(model, target, config.n_tv_grid, device, dtype)
+    loss_l1 = contrast_l1_loss(model, target, 1024, device, dtype)
+    loss_lf = loss_pde + loss_boundary
+    if config.loss_preset == "paper":
+        loss_ldw = paper_weighted_data_loss(
+            model,
+            data_xy,
+            data_dirs,
+            data_target,
+            gamma=config.adaptive_gamma,
+            delta=config.adaptive_delta,
+        )
+        loss_lep = edge_preserving_loss(model, target, config.n_tv_grid, device, dtype, config.edge_delta)
+        total = config.lambda_f * loss_lf + config.lambda_d * loss_ldw + config.lambda_ep * loss_lep
+    else:
+        loss_ldw = torch.zeros((), dtype=dtype, device=device)
+        loss_lep = torch.zeros((), dtype=dtype, device=device)
+        total = (
+            config.weight_data * loss_data
+            + config.weight_pde * loss_pde
+            + config.weight_boundary * loss_boundary
+            + config.weight_integral_data * loss_integral
+            + config.weight_tv * loss_tv
+            + config.weight_contrast_l1 * loss_l1
+        )
+    return {
+        "total": total,
+        "data": loss_data,
+        "integral_data": loss_integral,
+        "pde": loss_pde,
+        "boundary": loss_boundary,
+        "tv": loss_tv,
+        "contrast_l1": loss_l1,
+        "lf": loss_lf,
+        "ldw": loss_ldw,
+        "lep": loss_lep,
+    }
+
+
 def train_double_branch_pinn(
     data_dir: Path,
     target: TargetSpec,
@@ -1144,9 +1263,13 @@ def train_double_branch_pinn_from_observations(
     radius = config.domain_radius or obs.receiver_radius * 0.98
 
     model = DoubleBranchPINN(config, target).to(device=device, dtype=dtype)
+    resume_step = 0
     if config.resume_checkpoint:
         checkpoint = torch.load(config.resume_checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["model"])
+        checkpoint_model = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+        model.load_state_dict(checkpoint_model)
+        if isinstance(checkpoint, dict):
+            resume_step = int(checkpoint.get("step", 0) or 0)
         print(f"Loaded checkpoint: {config.resume_checkpoint}", flush=True)
     metadata = {
         "target": asdict(target),
@@ -1166,9 +1289,12 @@ def train_double_branch_pinn_from_observations(
     model.train()
 
     # ==================================================
-    # 第一阶段：Adam 粗收敛（10000步，快速下降）
+    # Stage 1: Adam optimization.
     # ==================================================
-    print("=== 阶段1：Adam 优化开始 ===", flush=True)
+    if config.epochs_adam <= 0:
+        print("=== Stage 1: Adam skipped ===", flush=True)
+    else:
+        print("=== Stage 1: Adam optimization starts ===", flush=True)
     optimizer_adam = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer_adam, T_max=max(config.epochs_adam, 1), eta_min=config.learning_rate * 0.05
@@ -1177,7 +1303,7 @@ def train_double_branch_pinn_from_observations(
     for step in range(1, config.epochs_adam + 1):
         optimizer_adam.zero_grad(set_to_none=True)
 
-        # ---------- 采样 + 损失计算（和原代码完全一致，未改动） ----------
+        # Sample points and compute the same weighted loss terms used by Adam.
         data_indices, data_xy, data_dirs, _data_amps, data_target = sample_observation_batch(
             obs_tensors, config.data_batch_per_direction
         )
@@ -1188,26 +1314,25 @@ def train_double_branch_pinn_from_observations(
         bc_xy = sample_boundary_points(config.n_boundary, obs.receiver_radius, device, dtype)
         bc_dirs = sample_directions(obs_tensors.unique_directions, config.n_boundary)
 
-        loss_data = data_loss(model, data_xy, data_dirs, data_target, robust=config.robust_data_weighting)
-        loss_pde = pde_residual_loss(model, pde_xy, pde_dirs, pde_amps, config)
-        loss_boundary = sommerfeld_boundary_loss(model, bc_xy, bc_dirs, config)
-        if integral_tensors is None:
-            loss_integral = torch.zeros((), dtype=dtype, device=device)
-        else:
-            loss_integral = volume_integral_data_loss(
-                model, data_indices, data_dirs, data_target, integral_tensors, obs_tensors, target, config
-            )
-        loss_tv = total_variation_loss(model, target, config.n_tv_grid, device, dtype)
-        loss_l1 = contrast_l1_loss(model, target, 1024, device, dtype)
-
-        total = (
-            config.weight_data * loss_data
-            + config.weight_pde * loss_pde
-            + config.weight_boundary * loss_boundary
-            + config.weight_integral_data * loss_integral
-            + config.weight_tv * loss_tv
-            + config.weight_contrast_l1 * loss_l1
+        losses = compute_loss_terms(
+            model,
+            data_xy=data_xy,
+            data_dirs=data_dirs,
+            data_target=data_target,
+            data_indices=data_indices,
+            pde_xy=pde_xy,
+            pde_dirs=pde_dirs,
+            pde_amps=pde_amps,
+            bc_xy=bc_xy,
+            bc_dirs=bc_dirs,
+            integral_tensors=integral_tensors,
+            obs_tensors=obs_tensors,
+            target=target,
+            config=config,
+            device=device,
+            dtype=dtype,
         )
+        total = losses["total"]
 
         total.backward()
         if config.gradient_clip_norm > 0:
@@ -1217,142 +1342,32 @@ def train_double_branch_pinn_from_observations(
 
         loss_items = {
             "total": float(total.detach().cpu()),
-            "data": float(loss_data.detach().cpu()),
-            "integral_data": float(loss_integral.detach().cpu()),
-            "pde": float(loss_pde.detach().cpu()),
-            "boundary": float(loss_boundary.detach().cpu()),
-            "tv": float(loss_tv.detach().cpu()),
-            "contrast_l1": float(loss_l1.detach().cpu()),
+            "data": float(losses["data"].detach().cpu()),
+            "integral_data": float(losses["integral_data"].detach().cpu()),
+            "pde": float(losses["pde"].detach().cpu()),
+            "boundary": float(losses["boundary"].detach().cpu()),
+            "tv": float(losses["tv"].detach().cpu()),
+            "contrast_l1": float(losses["contrast_l1"].detach().cpu()),
+            "lf": float(losses["lf"].detach().cpu()),
+            "ldw": float(losses["ldw"].detach().cpu()),
+            "lep": float(losses["lep"].detach().cpu()),
         }
         last_loss_items = loss_items
 
         checkpoint_path = ""
-        checkpoint_due = config.checkpoint_every > 0 and step % config.checkpoint_every == 0
+        global_step = resume_step + step
+        checkpoint_due = config.checkpoint_every > 0 and global_step % config.checkpoint_every == 0
         if checkpoint_due:
-            checkpoint_file = output_dir / f"checkpoint_adam_{step:06d}.pt"
+            checkpoint_file = output_dir / f"checkpoint_adam_{global_step:06d}.pt"
             save_torch_file(
-                {"model": model.state_dict(), "config": asdict(config), "target": asdict(target), "step": step},
+                {"model": model.state_dict(), "config": asdict(config), "target": asdict(target), "step": global_step},
                 checkpoint_file,
             )
             checkpoint_path = str(checkpoint_file)
 
-        # 日志 + 检查点（和原逻辑一致）
+        # Log metrics and save checkpoints on the existing schedule.
         should_log = step == 1 or step % config.log_every == 0
         if should_log or checkpoint_due:
-            _, _, _, _, _, metric_items = evaluate_epsilon_reconstruction(model, target, config, device, dtype)
-            evaluation_history.append(
-                make_evaluation_row(
-                    epoch=step,
-                    loss_items=loss_items,
-                    metrics=metric_items,
-                    checkpoint_path=checkpoint_path,
-                )
-            )
-            row = {
-                "step": float(step),
-                **loss_items,
-                "rel_error_continuous": metric_items["rel_error_continuous"],
-                "ssim_continuous": metric_items["ssim_continuous"],
-                "rel_error_thresholded": metric_items["rel_error_thresholded"],
-                "ssim_thresholded": metric_items["ssim_thresholded"],
-                "elapsed_s": float(time.time() - start_time),
-            }
-            history.append(row)
-            if should_log:
-                print(
-                    "Adam step={step:6.0f} total={total:.4e} data={data:.4e} "
-                    "int={integral_data:.4e} pde={pde:.4e} "
-                    "bc={boundary:.4e} tv={tv:.4e} "
-                    "rel={rel_error_continuous:.4f} rel_thr={rel_error_thresholded:.4f}".format(**row),
-                    flush=True,
-                )
-    if config.epochs_lbfgs <= 0:
-        print("\n=== Stage 2: L-BFGS disabled; keeping Adam result ===", flush=True)
-    else:
-        # ==================================================
-        # 第二阶段：L-BFGS-B 介电常数专属精修（冻结场分支 + 批量连续迭代）
-        # ==================================================
-        print("\n=== Stage 2: L-BFGS starts; field branch frozen, epsilon branch refined ===", flush=True)
-
-        # 冻结场分支所有参数，L-BFGS只优化介电常数分布，避免耦合紊乱产生伪影
-        for param in model.field_branch.parameters():
-            param.requires_grad = False
-
-        optimizer_lbfgs = torch.optim.LBFGS(
-            filter(lambda p: p.requires_grad, model.parameters()),  # 仅优化可训练的介电常数分支
-            max_iter=config.log_every,  # 每批次内部连续迭代，积累曲率信息，解决卡死
-            history_size=config.lbfgs_history_size,
-            line_search_fn=None,  # 关闭强Wolfe线搜索，适配TV非光滑损失，杜绝卡死
-            tolerance_grad=1e-12,  # 收紧收敛阈值，避免提前停止
-            tolerance_change=1e-12,
-        )
-
-        data_indices, data_xy, data_dirs, _data_amps, data_target = sample_observation_batch(
-            obs_tensors, config.data_batch_per_direction
-        )
-        pde_xy = sample_collocation_points(config.n_pde, target, radius, device, dtype)
-        pde_dirs, pde_amps = sample_direction_batch(
-            obs_tensors.unique_directions, obs_tensors.unique_amplitudes, config.n_pde
-        )
-        bc_xy = sample_boundary_points(config.n_boundary, obs.receiver_radius, device, dtype)
-        bc_dirs = sample_directions(obs_tensors.unique_directions, config.n_boundary)
-        current_loss_items = {}
-
-        def lbfgs_closure():
-            optimizer_lbfgs.zero_grad(set_to_none=True)
-            loss_data = data_loss(model, data_xy, data_dirs, data_target, robust=config.robust_data_weighting)
-            loss_pde = pde_residual_loss(model, pde_xy, pde_dirs, pde_amps, config)
-            loss_boundary = sommerfeld_boundary_loss(model, bc_xy, bc_dirs, config)
-            if integral_tensors is None:
-                loss_integral = torch.zeros((), dtype=dtype, device=device)
-            else:
-                loss_integral = volume_integral_data_loss(
-                    model, data_indices, data_dirs, data_target, integral_tensors, obs_tensors, target, config
-                )
-            loss_tv = total_variation_loss(model, target, config.n_tv_grid, device, dtype)
-            loss_l1 = contrast_l1_loss(model, target, 1024, device, dtype)
-            total = (
-                config.weight_data * loss_data
-                + config.weight_pde * loss_pde
-                + config.weight_boundary * loss_boundary
-                + config.weight_integral_data * loss_integral
-                + config.weight_tv * loss_tv
-                + config.weight_contrast_l1 * loss_l1
-            )
-            total.backward()
-            current_loss_items.update(
-                {
-                    "data": float(loss_data.detach().cpu()),
-                    "integral_data": float(loss_integral.detach().cpu()),
-                    "pde": float(loss_pde.detach().cpu()),
-                    "boundary": float(loss_boundary.detach().cpu()),
-                    "tv": float(loss_tv.detach().cpu()),
-                    "contrast_l1": float(loss_l1.detach().cpu()),
-                }
-            )
-            return total
-
-        n_batches = math.ceil(config.epochs_lbfgs / max(config.log_every, 1))
-        for batch_idx in range(n_batches):
-            global_step = min(
-                config.epochs_adam + (batch_idx + 1) * config.log_every,
-                config.epochs_adam + config.epochs_lbfgs,
-            )
-            loss_val = optimizer_lbfgs.step(lbfgs_closure)
-            loss_items = {
-                "total": float(loss_val.detach().cpu()),
-                **current_loss_items,
-            }
-            last_loss_items = loss_items
-            checkpoint_path = ""
-            if config.checkpoint_every > 0 and global_step % config.checkpoint_every == 0:
-                checkpoint_file = output_dir / f"checkpoint_lbfgs_{global_step:06d}.pt"
-                save_torch_file(
-                    {"model": model.state_dict(), "config": asdict(config), "target": asdict(target), "step": global_step},
-                    checkpoint_file,
-                )
-                checkpoint_path = str(checkpoint_file)
-
             _, _, _, _, _, metric_items = evaluate_epsilon_reconstruction(model, target, config, device, dtype)
             evaluation_history.append(
                 make_evaluation_row(
@@ -1372,18 +1387,167 @@ def train_double_branch_pinn_from_observations(
                 "elapsed_s": float(time.time() - start_time),
             }
             history.append(row)
-            print(
-                "LBFGS step={step:6.0f} total={total:.4e} data={data:.4e} "
-                "int={integral_data:.4e} pde={pde:.4e} "
-                "bc={boundary:.4e} tv={tv:.4e} "
-                "rel={rel_error_continuous:.4f} rel_thr={rel_error_thresholded:.4f}".format(**row),
-                flush=True,
-            )
+            if should_log:
+                if config.loss_preset == "paper":
+                    print(
+                        "Adam step={step:6.0f} total={total:.4e} lf={lf:.4e} "
+                        "ldw={ldw:.4e} lep={lep:.4e} "
+                        "rel={rel_error_continuous:.4f} rel_thr={rel_error_thresholded:.4f}".format(**row),
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "Adam step={step:6.0f} total={total:.4e} data={data:.4e} "
+                        "int={integral_data:.4e} pde={pde:.4e} "
+                        "bc={boundary:.4e} tv={tv:.4e} "
+                        "rel={rel_error_continuous:.4f} rel_thr={rel_error_thresholded:.4f}".format(**row),
+                        flush=True,
+                    )
+    lbfgs_steps = int(config.lbfgs_steps if config.lbfgs_steps > 0 else config.epochs_lbfgs)
+    if lbfgs_steps <= 0:
+        print("\n=== Stage 2: L-BFGS disabled; keeping Adam result ===", flush=True)
+    else:
+        # Stage 2: optional L-BFGS refinement after Adam.
+        print("\n=== Stage 2: L-BFGS refinement starts ===", flush=True)
+        optimizer_lbfgs_refine = torch.optim.LBFGS(
+            model.parameters(),
+            lr=config.lbfgs_lr,
+            max_iter=config.lbfgs_max_iter,
+            history_size=config.lbfgs_history_size,
+            line_search_fn="strong_wolfe",
+            tolerance_grad=1e-12,
+            tolerance_change=1e-12,
+        )
+        current_loss_items: Dict[str, float] = {}
 
-        for param in model.field_branch.parameters():
-            param.requires_grad = True
+        for lbfgs_step in range(1, lbfgs_steps + 1):
+            data_indices, data_xy, data_dirs, _data_amps, data_target = sample_observation_batch(
+                obs_tensors, config.data_batch_per_direction
+            )
+            pde_xy = sample_collocation_points(config.n_pde, target, radius, device, dtype)
+            pde_dirs, pde_amps = sample_direction_batch(
+                obs_tensors.unique_directions, obs_tensors.unique_amplitudes, config.n_pde
+            )
+            bc_xy = sample_boundary_points(config.n_boundary, obs.receiver_radius, device, dtype)
+            bc_dirs = sample_directions(obs_tensors.unique_directions, config.n_boundary)
+
+            def lbfgs_refine_closure():
+                optimizer_lbfgs_refine.zero_grad(set_to_none=True)
+                losses = compute_loss_terms(
+                    model,
+                    data_xy=data_xy,
+                    data_dirs=data_dirs,
+                    data_target=data_target,
+                    data_indices=data_indices,
+                    pde_xy=pde_xy,
+                    pde_dirs=pde_dirs,
+                    pde_amps=pde_amps,
+                    bc_xy=bc_xy,
+                    bc_dirs=bc_dirs,
+                    integral_tensors=integral_tensors,
+                    obs_tensors=obs_tensors,
+                    target=target,
+                    config=config,
+                    device=device,
+                    dtype=dtype,
+                )
+                total = losses["total"]
+                total.backward()
+                current_loss_items.update(
+                    {
+                        "data": float(losses["data"].detach().cpu()),
+                        "integral_data": float(losses["integral_data"].detach().cpu()),
+                        "pde": float(losses["pde"].detach().cpu()),
+                        "boundary": float(losses["boundary"].detach().cpu()),
+                        "tv": float(losses["tv"].detach().cpu()),
+                        "contrast_l1": float(losses["contrast_l1"].detach().cpu()),
+                        "lf": float(losses["lf"].detach().cpu()),
+                        "ldw": float(losses["ldw"].detach().cpu()),
+                        "lep": float(losses["lep"].detach().cpu()),
+                    }
+                )
+                return total
+
+            global_step = resume_step + config.epochs_adam + lbfgs_step
+            loss_val = optimizer_lbfgs_refine.step(lbfgs_refine_closure)
+            loss_items = {
+                "total": float(loss_val.detach().cpu()),
+                **current_loss_items,
+            }
+            last_loss_items = loss_items
+            checkpoint_path = ""
+            checkpoint_due = config.checkpoint_every > 0 and global_step % config.checkpoint_every == 0
+            if checkpoint_due:
+                checkpoint_file = output_dir / f"checkpoint_lbfgs_{global_step:06d}.pt"
+                save_torch_file(
+                    {"model": model.state_dict(), "config": asdict(config), "target": asdict(target), "step": global_step},
+                    checkpoint_file,
+                )
+                checkpoint_path = str(checkpoint_file)
+
+            should_log = lbfgs_step == 1 or lbfgs_step % max(config.log_every, 1) == 0
+            if should_log or checkpoint_due:
+                _, _, _, _, _, metric_items = evaluate_epsilon_reconstruction(model, target, config, device, dtype)
+                evaluation_history.append(
+                    make_evaluation_row(
+                        epoch=global_step,
+                        loss_items=loss_items,
+                        metrics=metric_items,
+                        checkpoint_path=checkpoint_path,
+                    )
+                )
+                row = {
+                    "step": float(global_step),
+                    **loss_items,
+                    "rel_error_continuous": metric_items["rel_error_continuous"],
+                    "ssim_continuous": metric_items["ssim_continuous"],
+                    "rel_error_thresholded": metric_items["rel_error_thresholded"],
+                    "ssim_thresholded": metric_items["ssim_thresholded"],
+                    "elapsed_s": float(time.time() - start_time),
+                }
+                history.append(row)
+                if config.loss_preset == "paper":
+                    print(
+                        "LBFGS step={step:6.0f} total={total:.4e} lf={lf:.4e} "
+                        "ldw={ldw:.4e} lep={lep:.4e} "
+                        "rel={rel_error_continuous:.4f} rel_thr={rel_error_thresholded:.4f}".format(**row),
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "LBFGS step={step:6.0f} total={total:.4e} data={data:.4e} "
+                        "int={integral_data:.4e} pde={pde:.4e} "
+                        "bc={boundary:.4e} tv={tv:.4e} "
+                        "rel={rel_error_continuous:.4f} rel_thr={rel_error_thresholded:.4f}".format(**row),
+                        flush=True,
+                    )
+
+        lbfgs_checkpoint = output_dir / "model_lbfgs_final.pt"
+        save_torch_file(
+            {
+                "model": model.state_dict(),
+                "config": asdict(config),
+                "target": asdict(target),
+                "step": resume_step + config.epochs_adam + lbfgs_steps,
+            },
+            lbfgs_checkpoint,
+        )
+        _, _, pred_lbfgs, _, _, lbfgs_metric_items = evaluate_epsilon_reconstruction(
+            model, target, config, device, dtype
+        )
+        np.save(output_dir / "epsilon_reconstruction_lbfgs.npy", pred_lbfgs)
+        lbfgs_metrics = {
+            "relative_error": lbfgs_metric_items["rel_error_continuous"],
+            "ssim": lbfgs_metric_items["ssim_continuous"],
+            **lbfgs_metric_items,
+            "elapsed_s": float(time.time() - start_time),
+            "noise_level": config.noise_level,
+        }
+        with (output_dir / "metrics_lbfgs.json").open("w", encoding="utf-8") as f:
+            json.dump(lbfgs_metrics, f, indent=2, ensure_ascii=False)
+
     final_checkpoint = output_dir / "model_final.pt"
-    final_step = config.epochs_adam + config.epochs_lbfgs
+    final_step = resume_step + config.epochs_adam + lbfgs_steps
     save_torch_file(
         {
             "model": model.state_dict(),

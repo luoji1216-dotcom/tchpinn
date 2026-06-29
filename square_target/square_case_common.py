@@ -38,8 +38,16 @@ def build_square_parser(description: str) -> argparse.ArgumentParser:
         "--epochs-lbfgs",
         type=int,
         default=0,
-        help="L-BFGS refinement iterations. Use 0 to keep the Adam-only result.",
+        help="Compatibility alias for --lbfgs-steps.",
     )
+    parser.add_argument(
+        "--lbfgs-steps",
+        type=int,
+        default=None,
+        help="Optional L-BFGS refinement steps after Adam. Use 0 to keep the Adam-only result.",
+    )
+    parser.add_argument("--lbfgs-lr", type=float, default=1.0, help="L-BFGS learning rate.")
+    parser.add_argument("--lbfgs-max-iter", type=int, default=20, help="Internal iterations per L-BFGS step.")
     parser.add_argument("--lbfgs-history-size", type=int, default=50, help="L-BFGS history size.")
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', or 'cuda'.")
     parser.add_argument("--dtype", default="float32", choices=["float32", "float64"])
@@ -83,6 +91,13 @@ def build_square_parser(description: str) -> argparse.ArgumentParser:
         help="Load a saved checkpoint/model before training or L-BFGS refinement.",
     )
     parser.add_argument("--no-robust-data", action="store_true")
+    parser.add_argument("--loss-preset", choices=["current", "paper"], default="current")
+    parser.add_argument("--lambda-f", type=float, default=1.0)
+    parser.add_argument("--lambda-d", type=float, default=100.0)
+    parser.add_argument("--lambda-ep", type=float, default=100.0)
+    parser.add_argument("--adaptive-gamma", type=float, default=1.0)
+    parser.add_argument("--adaptive-delta", type=float, default=1.0e-8)
+    parser.add_argument("--edge-delta", type=float, default=1.0e-3)
     parser.add_argument("--weight-data", type=float, default=100.0)
     parser.add_argument("--weight-pde", type=float, default=0.02)
     parser.add_argument("--weight-boundary", type=float, default=0.02)
@@ -162,6 +177,7 @@ def run_square_case(
         roi_half_width=0.5,
         square_side=0.4,
     )
+    lbfgs_steps = args.lbfgs_steps if args.lbfgs_steps is not None else args.epochs_lbfgs
     config = TrainConfig(
         frequency_hz=frequency_hz,
         incident_amplitude=args.incident_amplitude,
@@ -173,7 +189,10 @@ def run_square_case(
         eps_initial=args.eps_initial,
         domain_radius=args.domain_radius,
         epochs_adam=args.epochs if args.epochs is not None else args.epochs_adam,
-        epochs_lbfgs=args.epochs_lbfgs,
+        epochs_lbfgs=0,
+        lbfgs_steps=lbfgs_steps,
+        lbfgs_lr=args.lbfgs_lr,
+        lbfgs_max_iter=args.lbfgs_max_iter,
         lbfgs_history_size=args.lbfgs_history_size,
         learning_rate=args.lr,
         device=args.device,
@@ -189,6 +208,13 @@ def run_square_case(
         log_every=args.log_every,
         checkpoint_every=args.checkpoint_every,
         robust_data_weighting=not args.no_robust_data,
+        loss_preset=args.loss_preset,
+        lambda_f=args.lambda_f,
+        lambda_d=args.lambda_d,
+        lambda_ep=args.lambda_ep,
+        adaptive_gamma=args.adaptive_gamma,
+        adaptive_delta=args.adaptive_delta,
+        edge_delta=args.edge_delta,
         weight_data=args.weight_data,
         weight_pde=args.weight_pde,
         weight_boundary=args.weight_boundary,
