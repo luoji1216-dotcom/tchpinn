@@ -57,6 +57,16 @@ Useful quick test:
 T:\anaconda3\envs\py\python.exe .\square_target\run_5_3_2_square_0_3ghz_pinn.py --device cuda --epochs 300 --checkpoint-every 0 --output-dir results_quick_check
 ```
 
+The PINN run now writes `evaluation_metrics.csv` beside `loss_history.csv`. Each evaluation/checkpoint row records loss components plus continuous and thresholded epsilon-map relative error/SSIM. Thresholding uses the midpoint between the binary target permittivities, `(eps_background + eps_object) / 2`.
+
+Compare continuous and thresholded metrics:
+
+```powershell
+T:\anaconda3\envs\py\python.exe .\square_target\compare_pinn_metrics.py .\square_target\results_square_0_3GHz_adam\evaluation_metrics.csv
+```
+
+This prints the best epoch for each metric and writes `pinn_relative_error_curve.png` and `pinn_ssim_curve.png` into the CSV directory.
+
 Imaginary-part convention diagnostic:
 
 ```powershell

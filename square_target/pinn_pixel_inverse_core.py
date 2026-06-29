@@ -878,6 +878,85 @@ def global_ssim(pred: np.ndarray, truth: np.ndarray, data_range: float) -> float
     return float(numerator / denominator)
 
 
+def threshold_epsilon_map(
+    eps: np.ndarray,
+    target: TargetSpec,
+    threshold: Optional[float] = None,
+) -> np.ndarray:
+    """Binarize epsilon with the midpoint between background and object permittivity.
+
+    The square-target ground truth is binary: eps_background outside the target and
+    eps_object inside it.  When no explicit threshold is supplied, the midpoint
+    is the neutral cutoff between those two values.
+    """
+    cutoff = 0.5 * (target.eps_background + target.eps_object) if threshold is None else threshold
+    return np.where(eps >= cutoff, target.eps_object, target.eps_background).astype(np.float64)
+
+
+def epsilon_metrics(pred: np.ndarray, truth: np.ndarray, target: TargetSpec) -> Dict[str, float]:
+    data_range = target.eps_object - target.eps_background
+    thresholded = threshold_epsilon_map(pred, target)
+    return {
+        "rel_error_continuous": relative_error(pred, truth),
+        "ssim_continuous": global_ssim(pred, truth, data_range),
+        "rel_error_thresholded": relative_error(thresholded, truth),
+        "ssim_thresholded": global_ssim(thresholded, truth, data_range),
+    }
+
+
+def evaluate_epsilon_reconstruction(
+    model: DoubleBranchPINN,
+    target: TargetSpec,
+    config: TrainConfig,
+    device: "torch.device",
+    dtype: "torch.dtype",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, float]]:
+    was_training = model.training
+    x, y, pred = reconstruct_epsilon(model, target, config.plot_grid_size, device, dtype)
+    if was_training:
+        model.train()
+    _, _, truth = true_epsilon_grid(target, config.plot_grid_size)
+    thresholded = threshold_epsilon_map(pred, target)
+    return x, y, pred, truth, thresholded, epsilon_metrics(pred, truth, target)
+
+
+EVALUATION_FIELDNAMES = [
+    "epoch",
+    "total_loss",
+    "data_loss",
+    "pde_loss",
+    "boundary_loss",
+    "tv_loss",
+    "rel_error_continuous",
+    "ssim_continuous",
+    "rel_error_thresholded",
+    "ssim_thresholded",
+    "checkpoint_path",
+]
+
+
+def make_evaluation_row(
+    *,
+    epoch: int,
+    loss_items: Dict[str, float],
+    metrics: Dict[str, float],
+    checkpoint_path: str = "",
+) -> Dict[str, object]:
+    return {
+        "epoch": int(epoch),
+        "total_loss": float(loss_items.get("total", float("nan"))),
+        "data_loss": float(loss_items.get("data", float("nan"))),
+        "pde_loss": float(loss_items.get("pde", float("nan"))),
+        "boundary_loss": float(loss_items.get("boundary", float("nan"))),
+        "tv_loss": float(loss_items.get("tv", float("nan"))),
+        "rel_error_continuous": float(metrics["rel_error_continuous"]),
+        "ssim_continuous": float(metrics["ssim_continuous"]),
+        "rel_error_thresholded": float(metrics["rel_error_thresholded"]),
+        "ssim_thresholded": float(metrics["ssim_thresholded"]),
+        "checkpoint_path": checkpoint_path,
+    }
+
+
 def configure_matplotlib() -> None:
     import matplotlib as mpl
 
@@ -997,7 +1076,7 @@ def plot_loss(history: List[Dict[str, float]], out_path: Path) -> None:
     plt.close(fig)
 
 
-def save_history_csv(history: List[Dict[str, float]], out_path: Path) -> None:
+def save_history_csv(history: List[Dict[str, object]], out_path: Path) -> None:
     if not history:
         return
     keys = list(history[0].keys())
@@ -1005,6 +1084,15 @@ def save_history_csv(history: List[Dict[str, float]], out_path: Path) -> None:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
         writer.writerows(history)
+
+
+def save_evaluation_csv(rows: List[Dict[str, object]], out_path: Path) -> None:
+    if not rows:
+        return
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=EVALUATION_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def json_ready(value):
@@ -1071,7 +1159,9 @@ def train_double_branch_pinn_from_observations(
     }
     with (output_dir / "run_config.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
-    history: List[Dict[str, float]] = []
+    history: List[Dict[str, object]] = []
+    evaluation_history: List[Dict[str, object]] = []
+    last_loss_items: Dict[str, float] = {}
     start_time = time.time()
     model.train()
 
@@ -1125,32 +1215,57 @@ def train_double_branch_pinn_from_observations(
         optimizer_adam.step()
         scheduler.step()
 
+        loss_items = {
+            "total": float(total.detach().cpu()),
+            "data": float(loss_data.detach().cpu()),
+            "integral_data": float(loss_integral.detach().cpu()),
+            "pde": float(loss_pde.detach().cpu()),
+            "boundary": float(loss_boundary.detach().cpu()),
+            "tv": float(loss_tv.detach().cpu()),
+            "contrast_l1": float(loss_l1.detach().cpu()),
+        }
+        last_loss_items = loss_items
+
+        checkpoint_path = ""
+        checkpoint_due = config.checkpoint_every > 0 and step % config.checkpoint_every == 0
+        if checkpoint_due:
+            checkpoint_file = output_dir / f"checkpoint_adam_{step:06d}.pt"
+            save_torch_file(
+                {"model": model.state_dict(), "config": asdict(config), "target": asdict(target), "step": step},
+                checkpoint_file,
+            )
+            checkpoint_path = str(checkpoint_file)
+
         # 日志 + 检查点（和原逻辑一致）
-        if step == 1 or step % config.log_every == 0:
+        should_log = step == 1 or step % config.log_every == 0
+        if should_log or checkpoint_due:
+            _, _, _, _, _, metric_items = evaluate_epsilon_reconstruction(model, target, config, device, dtype)
+            evaluation_history.append(
+                make_evaluation_row(
+                    epoch=step,
+                    loss_items=loss_items,
+                    metrics=metric_items,
+                    checkpoint_path=checkpoint_path,
+                )
+            )
             row = {
                 "step": float(step),
-                "total": float(total.detach().cpu()),
-                "data": float(loss_data.detach().cpu()),
-                "integral_data": float(loss_integral.detach().cpu()),
-                "pde": float(loss_pde.detach().cpu()),
-                "boundary": float(loss_boundary.detach().cpu()),
-                "tv": float(loss_tv.detach().cpu()),
-                "contrast_l1": float(loss_l1.detach().cpu()),
+                **loss_items,
+                "rel_error_continuous": metric_items["rel_error_continuous"],
+                "ssim_continuous": metric_items["ssim_continuous"],
+                "rel_error_thresholded": metric_items["rel_error_thresholded"],
+                "ssim_thresholded": metric_items["ssim_thresholded"],
                 "elapsed_s": float(time.time() - start_time),
             }
             history.append(row)
-            print(
-                "Adam step={step:6.0f} total={total:.4e} data={data:.4e} "
-                "int={integral_data:.4e} pde={pde:.4e} "
-                "bc={boundary:.4e} tv={tv:.4e}".format(**row),
-                flush=True,
-            )
-        if config.checkpoint_every > 0 and step % config.checkpoint_every == 0:
-            save_torch_file(
-                {"model": model.state_dict(), "config": asdict(config), "target": asdict(target), "step": step},
-                output_dir / f"checkpoint_adam_{step:06d}.pt",
-            )
-
+            if should_log:
+                print(
+                    "Adam step={step:6.0f} total={total:.4e} data={data:.4e} "
+                    "int={integral_data:.4e} pde={pde:.4e} "
+                    "bc={boundary:.4e} tv={tv:.4e} "
+                    "rel={rel_error_continuous:.4f} rel_thr={rel_error_thresholded:.4f}".format(**row),
+                    flush=True,
+                )
     if config.epochs_lbfgs <= 0:
         print("\n=== Stage 2: L-BFGS disabled; keeping Adam result ===", flush=True)
     else:
@@ -1224,48 +1339,98 @@ def train_double_branch_pinn_from_observations(
                 config.epochs_adam + config.epochs_lbfgs,
             )
             loss_val = optimizer_lbfgs.step(lbfgs_closure)
-            row = {
-                "step": float(global_step),
+            loss_items = {
                 "total": float(loss_val.detach().cpu()),
                 **current_loss_items,
+            }
+            last_loss_items = loss_items
+            checkpoint_path = ""
+            if config.checkpoint_every > 0 and global_step % config.checkpoint_every == 0:
+                checkpoint_file = output_dir / f"checkpoint_lbfgs_{global_step:06d}.pt"
+                save_torch_file(
+                    {"model": model.state_dict(), "config": asdict(config), "target": asdict(target), "step": global_step},
+                    checkpoint_file,
+                )
+                checkpoint_path = str(checkpoint_file)
+
+            _, _, _, _, _, metric_items = evaluate_epsilon_reconstruction(model, target, config, device, dtype)
+            evaluation_history.append(
+                make_evaluation_row(
+                    epoch=global_step,
+                    loss_items=loss_items,
+                    metrics=metric_items,
+                    checkpoint_path=checkpoint_path,
+                )
+            )
+            row = {
+                "step": float(global_step),
+                **loss_items,
+                "rel_error_continuous": metric_items["rel_error_continuous"],
+                "ssim_continuous": metric_items["ssim_continuous"],
+                "rel_error_thresholded": metric_items["rel_error_thresholded"],
+                "ssim_thresholded": metric_items["ssim_thresholded"],
                 "elapsed_s": float(time.time() - start_time),
             }
             history.append(row)
             print(
                 "LBFGS step={step:6.0f} total={total:.4e} data={data:.4e} "
                 "int={integral_data:.4e} pde={pde:.4e} "
-                "bc={boundary:.4e} tv={tv:.4e}".format(**row),
+                "bc={boundary:.4e} tv={tv:.4e} "
+                "rel={rel_error_continuous:.4f} rel_thr={rel_error_thresholded:.4f}".format(**row),
                 flush=True,
             )
-            if config.checkpoint_every > 0 and global_step % config.checkpoint_every == 0:
-                save_torch_file(
-                    {"model": model.state_dict(), "config": asdict(config), "target": asdict(target), "step": global_step},
-                    output_dir / f"checkpoint_lbfgs_{global_step:06d}.pt",
-                )
 
         for param in model.field_branch.parameters():
             param.requires_grad = True
+    final_checkpoint = output_dir / "model_final.pt"
+    final_step = config.epochs_adam + config.epochs_lbfgs
     save_torch_file(
         {
             "model": model.state_dict(),
             "config": asdict(config),
             "target": asdict(target),
-            "step": config.epochs_adam + config.epochs_lbfgs,
+            "step": final_step,
         },
-        output_dir / "model_final.pt",
+        final_checkpoint,
     )
-    save_history_csv(history, output_dir / "loss_history.csv")
 
-    x, y, pred = reconstruct_epsilon(model, target, config.plot_grid_size, device, dtype)
-    _, _, truth = true_epsilon_grid(target, config.plot_grid_size)
+    x, y, pred, truth, thresholded, metric_items = evaluate_epsilon_reconstruction(
+        model, target, config, device, dtype
+    )
+    if not evaluation_history or int(evaluation_history[-1]["epoch"]) != final_step:
+        evaluation_history.append(
+            make_evaluation_row(
+                epoch=final_step,
+                loss_items=last_loss_items,
+                metrics=metric_items,
+                checkpoint_path=str(final_checkpoint),
+            )
+        )
+    elif evaluation_history[-1].get("checkpoint_path"):
+        evaluation_history.append(
+            make_evaluation_row(
+                epoch=final_step,
+                loss_items=last_loss_items,
+                metrics=metric_items,
+                checkpoint_path=str(final_checkpoint),
+            )
+        )
+    else:
+        evaluation_history[-1]["checkpoint_path"] = str(final_checkpoint)
+
+    save_history_csv(history, output_dir / "loss_history.csv")
+    save_evaluation_csv(evaluation_history, output_dir / "evaluation_metrics.csv")
+
     np.save(output_dir / "epsilon_reconstruction.npy", pred)
+    np.save(output_dir / "epsilon_thresholded.npy", thresholded)
     np.save(output_dir / "epsilon_truth.npy", truth)
     np.save(output_dir / "x_grid.npy", x)
     np.save(output_dir / "y_grid.npy", y)
 
     metrics = {
-        "relative_error": relative_error(pred, truth),
-        "ssim": global_ssim(pred, truth, target.eps_object - target.eps_background),
+        "relative_error": metric_items["rel_error_continuous"],
+        "ssim": metric_items["ssim_continuous"],
+        **metric_items,
         "elapsed_s": float(time.time() - start_time),
         "noise_level": config.noise_level,
     }
