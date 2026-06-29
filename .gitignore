@@ -1,4 +1,5 @@
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pt
@@ -7,6 +8,18 @@ __pycache__/
 *.npz
 *.csv
 results*/
+austria_target/results*/
+austria_target/**/results*/
+austria_target/*.pt
+austria_target/*.pth
+austria_target/*.npy
+austria_target/__pycache__/
+austria_target/**/__pycache__/
+square_target/results*/
+square_target/**/results*/
+square_target/*.pt
+square_target/*.pth
+square_target/*.npy
 *_results/
 *.rar
 .idea/
