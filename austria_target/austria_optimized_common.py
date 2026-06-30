@@ -53,6 +53,7 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-every", type=int, default=0)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--no-robust-data", action="store_true")
     parser.add_argument("--diagnose-imag-sign", action="store_true")
     parser.add_argument("--weight-data", type=float, default=120.0)
@@ -158,6 +159,7 @@ def run_optimized_austria(
         plot_grid_size=args.plot_grid_size,
         log_every=args.log_every,
         checkpoint_every=args.checkpoint_every,
+        resume_checkpoint=args.resume_checkpoint,
         robust_data_weighting=not args.no_robust_data,
         weight_data=args.weight_data,
         weight_pde=args.weight_pde,
