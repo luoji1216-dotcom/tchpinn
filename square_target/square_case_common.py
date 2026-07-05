@@ -52,6 +52,14 @@ def build_square_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', or 'cuda'.")
     parser.add_argument("--dtype", default="float32", choices=["float32", "float64"])
     parser.add_argument("--lr", type=float, default=1.0e-3, help="Adam learning rate.")
+    parser.add_argument("--field-lr", type=float, default=None, help="Optional Adam learning rate for field_branch.")
+    parser.add_argument("--epsilon-lr", type=float, default=None, help="Optional Adam learning rate for epsilon_branch.")
+    parser.add_argument(
+        "--freeze-epsilon-steps",
+        type=int,
+        default=0,
+        help="Keep epsilon_branch Adam learning rate at zero for this many initial steps.",
+    )
     parser.add_argument("--incident-amplitude", type=float, default=0.1)
     parser.add_argument("--phase-sign", type=float, default=1.0)
     parser.add_argument("--eps-initial", type=float, default=1.5)
@@ -90,6 +98,11 @@ def build_square_parser(description: str) -> argparse.ArgumentParser:
         default=None,
         help="Load a saved checkpoint/model before training or L-BFGS refinement.",
     )
+    parser.add_argument(
+        "--resume-epsilon-from",
+        default=None,
+        help="Load only epsilon_branch parameters from a saved checkpoint; field_branch remains freshly initialized.",
+    )
     parser.add_argument("--no-robust-data", action="store_true")
     parser.add_argument("--loss-preset", choices=["current", "paper"], default="current")
     parser.add_argument("--lambda-f", type=float, default=1.0)
@@ -103,7 +116,23 @@ def build_square_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--weight-boundary", type=float, default=0.02)
     parser.add_argument("--weight-integral-data", type=float, default=500.0)
     parser.add_argument("--weight-tv", type=float, default=0.01)
-    parser.add_argument("--weight-contrast-l1", type=float, default=0.0)
+    parser.add_argument("--weight-edge-preserving", type=float, default=0.0)
+    parser.add_argument(
+        "--weight-contrast-l1",
+        "--contrast-l1-weight",
+        dest="weight_contrast_l1",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument("--binary-push-weight", type=float, default=0.0)
+    parser.add_argument("--epsilon-prior-weight", type=float, default=0.0)
+    parser.add_argument("--background-anchor-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--background-anchor-from",
+        default=None,
+        help="Checkpoint used to generate pseudo background points for --background-anchor-weight.",
+    )
+    parser.add_argument("--background-anchor-threshold", type=float, default=1.3)
     parser.add_argument("--field-hidden-layers", type=int, default=5)
     parser.add_argument("--field-hidden-units", type=int, default=80)
     parser.add_argument("--eps-hidden-layers", type=int, default=5)
@@ -198,9 +227,13 @@ def run_square_case(
         lbfgs_max_iter=args.lbfgs_max_iter,
         lbfgs_history_size=args.lbfgs_history_size,
         learning_rate=args.lr,
+        field_lr=args.field_lr,
+        epsilon_lr=args.epsilon_lr,
+        freeze_epsilon_steps=args.freeze_epsilon_steps,
         device=args.device,
         dtype=args.dtype,
         resume_checkpoint=args.resume_checkpoint,
+        resume_epsilon_from=args.resume_epsilon_from,
         max_points_per_direction=args.max_points_per_direction,
         data_batch_per_direction=args.data_batch_per_direction,
         n_pde=args.n_pde,
@@ -223,7 +256,13 @@ def run_square_case(
         weight_boundary=args.weight_boundary,
         weight_integral_data=args.weight_integral_data,
         weight_tv=args.weight_tv,
+        weight_edge_preserving=args.weight_edge_preserving,
         weight_contrast_l1=args.weight_contrast_l1,
+        binary_push_weight=args.binary_push_weight,
+        epsilon_prior_weight=args.epsilon_prior_weight,
+        background_anchor_weight=args.background_anchor_weight,
+        background_anchor_from=args.background_anchor_from,
+        background_anchor_threshold=args.background_anchor_threshold,
         field_hidden_layers=args.field_hidden_layers,
         field_hidden_units=args.field_hidden_units,
         eps_hidden_layers=args.eps_hidden_layers,

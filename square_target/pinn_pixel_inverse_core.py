@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import csv
+import copy
 import json
 import math
 import random
@@ -70,12 +71,21 @@ class TrainConfig:
     learning_rate: float = 1.0e-3
     # epochs_adam: int = 30000
     # learning_rate: float = 1.0e-3
+    field_lr: Optional[float] = None
+    epsilon_lr: Optional[float] = None
+    freeze_epsilon_steps: int = 0
     weight_data: float = 100.0
     weight_pde: float = 0.004
     weight_boundary: float = 0.04
     weight_integral_data: float = 0.0
     weight_tv: float = 0.025
     weight_contrast_l1: float = 1.0e-3
+    binary_push_weight: float = 0.0
+    epsilon_prior_weight: float = 0.0
+    weight_edge_preserving: float = 0.0
+    background_anchor_weight: float = 0.0
+    background_anchor_from: Optional[str] = None
+    background_anchor_threshold: float = 1.3
     robust_data_weighting: bool = True
     loss_preset: str = "current"
     lambda_f: float = 1.0
@@ -100,6 +110,7 @@ class TrainConfig:
     device: str = "auto"
     noise_level: float = 0.0
     resume_checkpoint: Optional[str] = None
+    resume_epsilon_from: Optional[str] = None
 
     @property
     def wavelength(self) -> float:
@@ -510,6 +521,33 @@ class DoubleBranchPINN(nn.Module):
         return self.epsilon_branch(xy)
 
 
+def load_epsilon_branch_only(
+    model: DoubleBranchPINN,
+    checkpoint_path: str,
+    device: "torch.device",
+) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint_model = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    epsilon_state = extract_epsilon_branch_state(checkpoint_model, checkpoint_path)
+    model.epsilon_branch.load_state_dict(epsilon_state)
+    print(
+        f"epsilon branch loaded from {checkpoint_path} ({len(epsilon_state)} tensors)",
+        flush=True,
+    )
+    print("field branch reinitialized", flush=True)
+
+
+def extract_epsilon_branch_state(checkpoint_model: dict, checkpoint_path: str) -> dict:
+    epsilon_state = {
+        key.removeprefix("epsilon_branch."): value
+        for key, value in checkpoint_model.items()
+        if key.startswith("epsilon_branch.")
+    }
+    if not epsilon_state:
+        raise ValueError(f"No epsilon_branch parameters found in checkpoint: {checkpoint_path}")
+    return epsilon_state
+
+
 def incident_field_torch(
     xy: "torch.Tensor",
     directions: "torch.Tensor",
@@ -690,6 +728,57 @@ def contrast_l1_loss(
     xy = (2.0 * torch.rand(n_points, 2, device=device, dtype=dtype) - 1.0) * target.roi_half_width
     eps = model.epsilon(xy)
     return torch.mean(torch.abs(eps - target.eps_background))
+
+
+def binary_push_loss(
+    model: DoubleBranchPINN,
+    target: TargetSpec,
+    n_points: int,
+    device: "torch.device",
+    dtype: "torch.dtype",
+) -> "torch.Tensor":
+    xy = (2.0 * torch.rand(n_points, 2, device=device, dtype=dtype) - 1.0) * target.roi_half_width
+    eps = model.epsilon(xy)
+    penalty = (eps - target.eps_background) * (target.eps_object - eps)
+    return torch.mean(torch.clamp(penalty, min=0.0))
+
+
+def epsilon_prior_loss(
+    model: DoubleBranchPINN,
+    epsilon_prior_branch: Optional[nn.Module],
+    target: TargetSpec,
+    n_points: int,
+    device: "torch.device",
+    dtype: "torch.dtype",
+) -> "torch.Tensor":
+    if epsilon_prior_branch is None:
+        return torch.zeros((), dtype=dtype, device=device)
+    xy = (2.0 * torch.rand(n_points, 2, device=device, dtype=dtype) - 1.0) * target.roi_half_width
+    eps = model.epsilon(xy)
+    with torch.no_grad():
+        eps_prior = epsilon_prior_branch(xy)
+    return torch.mean((eps - eps_prior).square())
+
+
+def background_anchor_loss(
+    model: DoubleBranchPINN,
+    background_anchor_branch: Optional[nn.Module],
+    target: TargetSpec,
+    n_points: int,
+    threshold: float,
+    device: "torch.device",
+    dtype: "torch.dtype",
+) -> "torch.Tensor":
+    if background_anchor_branch is None:
+        return torch.zeros((), dtype=dtype, device=device)
+    xy = (2.0 * torch.rand(n_points, 2, device=device, dtype=dtype) - 1.0) * target.roi_half_width
+    with torch.no_grad():
+        eps_anchor = background_anchor_branch(xy)
+        mask = eps_anchor[:, 0] < threshold
+    if not torch.any(mask):
+        return torch.zeros((), dtype=dtype, device=device)
+    eps = model.epsilon(xy[mask])
+    return torch.mean((eps - target.eps_background).square())
 
 
 def sample_points_in_circle(
@@ -1181,6 +1270,8 @@ def compute_loss_terms(
     config: TrainConfig,
     device: "torch.device",
     dtype: "torch.dtype",
+    epsilon_prior_branch: Optional[nn.Module] = None,
+    background_anchor_branch: Optional[nn.Module] = None,
 ) -> Dict[str, "torch.Tensor"]:
     loss_data = data_loss(model, data_xy, data_dirs, data_target, robust=config.robust_data_weighting)
     loss_pde = pde_residual_loss(model, pde_xy, pde_dirs, pde_amps, config)
@@ -1193,6 +1284,20 @@ def compute_loss_terms(
         )
     loss_tv = total_variation_loss(model, target, config.n_tv_grid, device, dtype)
     loss_l1 = contrast_l1_loss(model, target, 1024, device, dtype)
+    loss_binary_push = binary_push_loss(model, target, 1024, device, dtype)
+    loss_epsilon_prior = epsilon_prior_loss(
+        model, epsilon_prior_branch, target, 1024, device, dtype
+    )
+    loss_background_anchor = background_anchor_loss(
+        model,
+        background_anchor_branch,
+        target,
+        1024,
+        config.background_anchor_threshold,
+        device,
+        dtype,
+    )
+    loss_lep = edge_preserving_loss(model, target, config.n_tv_grid, device, dtype, config.edge_delta)
     loss_lf = loss_pde + loss_boundary
     if config.loss_preset == "paper":
         loss_ldw = paper_weighted_data_loss(
@@ -1203,11 +1308,9 @@ def compute_loss_terms(
             gamma=config.adaptive_gamma,
             delta=config.adaptive_delta,
         )
-        loss_lep = edge_preserving_loss(model, target, config.n_tv_grid, device, dtype, config.edge_delta)
         total = config.lambda_f * loss_lf + config.lambda_d * loss_ldw + config.lambda_ep * loss_lep
     else:
         loss_ldw = torch.zeros((), dtype=dtype, device=device)
-        loss_lep = torch.zeros((), dtype=dtype, device=device)
         total = (
             config.weight_data * loss_data
             + config.weight_pde * loss_pde
@@ -1215,6 +1318,10 @@ def compute_loss_terms(
             + config.weight_integral_data * loss_integral
             + config.weight_tv * loss_tv
             + config.weight_contrast_l1 * loss_l1
+            + config.binary_push_weight * loss_binary_push
+            + config.epsilon_prior_weight * loss_epsilon_prior
+            + config.weight_edge_preserving * loss_lep
+            + config.background_anchor_weight * loss_background_anchor
         )
     return {
         "total": total,
@@ -1224,6 +1331,9 @@ def compute_loss_terms(
         "boundary": loss_boundary,
         "tv": loss_tv,
         "contrast_l1": loss_l1,
+        "binary_push": loss_binary_push,
+        "epsilon_prior": loss_epsilon_prior,
+        "background_anchor": loss_background_anchor,
         "lf": loss_lf,
         "ldw": loss_ldw,
         "lep": loss_lep,
@@ -1264,6 +1374,8 @@ def train_double_branch_pinn_from_observations(
 
     model = DoubleBranchPINN(config, target).to(device=device, dtype=dtype)
     resume_step = 0
+    if config.resume_checkpoint and config.resume_epsilon_from:
+        raise ValueError("--resume-checkpoint and --resume-epsilon-from cannot be used together.")
     if config.resume_checkpoint:
         checkpoint = torch.load(config.resume_checkpoint, map_location=device, weights_only=False)
         checkpoint_model = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
@@ -1271,6 +1383,37 @@ def train_double_branch_pinn_from_observations(
         if isinstance(checkpoint, dict):
             resume_step = int(checkpoint.get("step", 0) or 0)
         print(f"Loaded checkpoint: {config.resume_checkpoint}", flush=True)
+    elif config.resume_epsilon_from:
+        load_epsilon_branch_only(model, config.resume_epsilon_from, device)
+    epsilon_prior_branch: Optional[nn.Module] = None
+    if config.epsilon_prior_weight > 0.0:
+        epsilon_prior_branch = copy.deepcopy(model.epsilon_branch).to(device=device, dtype=dtype)
+        epsilon_prior_branch.eval()
+        for param in epsilon_prior_branch.parameters():
+            param.requires_grad_(False)
+        print("epsilon prior initialized from current epsilon branch", flush=True)
+    background_anchor_branch: Optional[nn.Module] = None
+    if config.background_anchor_weight > 0.0:
+        if not config.background_anchor_from:
+            raise ValueError("--background-anchor-from is required when --background-anchor-weight > 0.")
+        anchor_checkpoint = torch.load(config.background_anchor_from, map_location=device, weights_only=False)
+        anchor_model = (
+            anchor_checkpoint["model"]
+            if isinstance(anchor_checkpoint, dict) and "model" in anchor_checkpoint
+            else anchor_checkpoint
+        )
+        background_anchor_branch = copy.deepcopy(model.epsilon_branch).to(device=device, dtype=dtype)
+        background_anchor_branch.load_state_dict(
+            extract_epsilon_branch_state(anchor_model, config.background_anchor_from)
+        )
+        background_anchor_branch.eval()
+        for param in background_anchor_branch.parameters():
+            param.requires_grad_(False)
+        print(
+            f"background anchor loaded from {config.background_anchor_from} "
+            f"(threshold={config.background_anchor_threshold:g})",
+            flush=True,
+        )
     metadata = {
         "target": asdict(target),
         "config": asdict(config),
@@ -1295,12 +1438,53 @@ def train_double_branch_pinn_from_observations(
         print("=== Stage 1: Adam skipped ===", flush=True)
     else:
         print("=== Stage 1: Adam optimization starts ===", flush=True)
-    optimizer_adam = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_adam, T_max=max(config.epochs_adam, 1), eta_min=config.learning_rate * 0.05
+    use_split_lrs = (
+        config.field_lr is not None
+        or config.epsilon_lr is not None
+        or config.freeze_epsilon_steps > 0
     )
+    if use_split_lrs:
+        field_base_lr = config.field_lr if config.field_lr is not None else config.learning_rate
+        epsilon_base_lr = config.epsilon_lr if config.epsilon_lr is not None else config.learning_rate
+        optimizer_adam = torch.optim.Adam(
+            [
+                {"params": model.field_branch.parameters(), "lr": field_base_lr, "name": "field"},
+                {"params": model.epsilon_branch.parameters(), "lr": epsilon_base_lr, "name": "epsilon"},
+            ]
+        )
+        scheduler = None
+        print(
+            f"Using split Adam learning rates: field_lr={field_base_lr:g}, "
+            f"epsilon_lr={epsilon_base_lr:g}, freeze_epsilon_steps={config.freeze_epsilon_steps}",
+            flush=True,
+        )
+    else:
+        optimizer_adam = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer_adam, T_max=max(config.epochs_adam, 1), eta_min=config.learning_rate * 0.05
+        )
+
+    def cosine_lr(base_lr: float, index: int, total_steps: int) -> float:
+        progress = min(max(index, 0), max(total_steps - 1, 1)) / max(total_steps - 1, 1)
+        factor = 0.05 + 0.5 * (1.0 - 0.05) * (1.0 + math.cos(math.pi * progress))
+        return base_lr * factor
 
     for step in range(1, config.epochs_adam + 1):
+        if use_split_lrs:
+            field_base_lr = config.field_lr if config.field_lr is not None else config.learning_rate
+            epsilon_base_lr = config.epsilon_lr if config.epsilon_lr is not None else config.learning_rate
+            remaining_eps_steps = max(config.epochs_adam - config.freeze_epsilon_steps, 1)
+            for group in optimizer_adam.param_groups:
+                if group.get("name") == "field":
+                    group["lr"] = cosine_lr(field_base_lr, step - 1, config.epochs_adam)
+                elif step <= config.freeze_epsilon_steps:
+                    group["lr"] = 0.0
+                else:
+                    group["lr"] = cosine_lr(
+                        epsilon_base_lr,
+                        step - config.freeze_epsilon_steps - 1,
+                        remaining_eps_steps,
+                    )
         optimizer_adam.zero_grad(set_to_none=True)
 
         # Sample points and compute the same weighted loss terms used by Adam.
@@ -1331,6 +1515,8 @@ def train_double_branch_pinn_from_observations(
             config=config,
             device=device,
             dtype=dtype,
+            epsilon_prior_branch=epsilon_prior_branch,
+            background_anchor_branch=background_anchor_branch,
         )
         total = losses["total"]
 
@@ -1338,7 +1524,8 @@ def train_double_branch_pinn_from_observations(
         if config.gradient_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
         optimizer_adam.step()
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
         loss_items = {
             "total": float(total.detach().cpu()),
@@ -1348,6 +1535,9 @@ def train_double_branch_pinn_from_observations(
             "boundary": float(losses["boundary"].detach().cpu()),
             "tv": float(losses["tv"].detach().cpu()),
             "contrast_l1": float(losses["contrast_l1"].detach().cpu()),
+            "binary_push": float(losses["binary_push"].detach().cpu()),
+            "epsilon_prior": float(losses["epsilon_prior"].detach().cpu()),
+            "background_anchor": float(losses["background_anchor"].detach().cpu()),
             "lf": float(losses["lf"].detach().cpu()),
             "ldw": float(losses["ldw"].detach().cpu()),
             "lep": float(losses["lep"].detach().cpu()),
@@ -1450,6 +1640,8 @@ def train_double_branch_pinn_from_observations(
                     config=config,
                     device=device,
                     dtype=dtype,
+                    epsilon_prior_branch=epsilon_prior_branch,
+                    background_anchor_branch=background_anchor_branch,
                 )
                 total = losses["total"]
                 total.backward()
@@ -1461,6 +1653,9 @@ def train_double_branch_pinn_from_observations(
                         "boundary": float(losses["boundary"].detach().cpu()),
                         "tv": float(losses["tv"].detach().cpu()),
                         "contrast_l1": float(losses["contrast_l1"].detach().cpu()),
+                        "binary_push": float(losses["binary_push"].detach().cpu()),
+                        "epsilon_prior": float(losses["epsilon_prior"].detach().cpu()),
+                        "background_anchor": float(losses["background_anchor"].detach().cpu()),
                         "lf": float(losses["lf"].detach().cpu()),
                         "ldw": float(losses["ldw"].detach().cpu()),
                         "lep": float(losses["lep"].detach().cpu()),
