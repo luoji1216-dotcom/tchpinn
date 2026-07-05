@@ -131,8 +131,10 @@ def diagnose_imaginary_sign(data_dir: Path, frequency_hz: float, phase_sign: flo
     k0 = 2.0 * math.pi * frequency_hz / 3.0e8
     for sign in (1.0, -1.0):
         print(f"\nObservation convention: Ez = Re {'+' if sign > 0 else '-'} i Im")
-        for file_name in ("+x.txt", "-x.txt"):
+        for file_name in ("+x.txt", "-x.txt", "+y.txt", "-y.txt"):
             path = data_dir / file_name
+            if not path.exists():
+                continue
             label, direction = parse_direction_from_name(path)
             xy, field = load_fem_table(path, imag_sign=sign)
             expected_res, expected_amp = _fit_plane_wave(
@@ -154,6 +156,7 @@ def run_square_case(
     default_data_dir: Path,
     default_output_dir: str,
     description: str,
+    direction_labels: tuple[str, ...] = ("+x", "-x"),
 ) -> None:
     args = build_square_parser(description).parse_args()
     data_dir = Path(args.data_dir).resolve() if args.data_dir else default_data_dir.resolve()
@@ -235,6 +238,6 @@ def run_square_case(
         target=target,
         config=config,
         output_dir=output_dir,
-        direction_labels=("+x", "-x"),
+        direction_labels=direction_labels,
     )
     print(json.dumps({"target": asdict(target), "metrics": metrics}, indent=2, ensure_ascii=False))
