@@ -64,6 +64,12 @@ def build_square_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--phase-sign", type=float, default=1.0)
     parser.add_argument("--eps-initial", type=float, default=1.5)
     parser.add_argument("--eps-max", type=float, default=5.0)
+    parser.add_argument(
+        "--epsilon-param",
+        choices=["direct", "fixed_contrast_mask"],
+        default="direct",
+        help="Epsilon parameterization for square experiments. direct keeps the existing MLP epsilon branch.",
+    )
     parser.add_argument("--domain-radius", type=float, default=None)
     parser.add_argument(
         "--observation-imag-sign",
@@ -104,7 +110,7 @@ def build_square_parser(description: str) -> argparse.ArgumentParser:
         help="Load only epsilon_branch parameters from a saved checkpoint; field_branch remains freshly initialized.",
     )
     parser.add_argument("--no-robust-data", action="store_true")
-    parser.add_argument("--loss-preset", choices=["current", "paper"], default="current")
+    parser.add_argument("--loss-preset", choices=["current", "paper", "paper_plus_integral"], default="current")
     parser.add_argument("--lambda-f", type=float, default=1.0)
     parser.add_argument("--lambda-d", type=float, default=100.0)
     parser.add_argument("--lambda-ep", type=float, default=100.0)
@@ -115,6 +121,7 @@ def build_square_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--weight-pde", type=float, default=0.02)
     parser.add_argument("--weight-boundary", type=float, default=0.02)
     parser.add_argument("--weight-integral-data", type=float, default=500.0)
+    parser.add_argument("--weight-field-integral-consistency", type=float, default=0.0)
     parser.add_argument("--weight-tv", type=float, default=0.01)
     parser.add_argument("--weight-edge-preserving", type=float, default=0.0)
     parser.add_argument(
@@ -219,6 +226,7 @@ def run_square_case(
         eps_min=1.0,
         eps_max=args.eps_max,
         eps_initial=args.eps_initial,
+        epsilon_parameterization="mlp" if args.epsilon_param == "direct" else args.epsilon_param,
         domain_radius=args.domain_radius,
         epochs_adam=args.epochs if args.epochs is not None else args.epochs_adam,
         epochs_lbfgs=0,
@@ -255,6 +263,7 @@ def run_square_case(
         weight_pde=args.weight_pde,
         weight_boundary=args.weight_boundary,
         weight_integral_data=args.weight_integral_data,
+        weight_field_integral_consistency=args.weight_field_integral_consistency,
         weight_tv=args.weight_tv,
         weight_edge_preserving=args.weight_edge_preserving,
         weight_contrast_l1=args.weight_contrast_l1,

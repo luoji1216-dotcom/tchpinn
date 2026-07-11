@@ -31,7 +31,26 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', 'cuda', or 'cuda:0'.")
     parser.add_argument("--dtype", default="float32", choices=["float32", "float64"])
     parser.add_argument("--lr", type=float, default=8.0e-4, help="Adam learning rate.")
+    parser.add_argument("--field-lr", type=float, default=None, help="Optional Adam learning rate for field_branch.")
+    parser.add_argument("--epsilon-lr", type=float, default=None, help="Optional Adam learning rate for epsilon_branch.")
+    parser.add_argument(
+        "--freeze-epsilon-steps",
+        type=int,
+        default=0,
+        help="Keep epsilon_branch Adam learning rate at zero for this many initial steps.",
+    )
+    parser.add_argument(
+        "--freeze-field-branch",
+        action="store_true",
+        help="Freeze field_branch parameters and optimize epsilon_branch only.",
+    )
     parser.add_argument("--incident-amplitude", type=float, default=0.1)
+    parser.add_argument(
+        "--incident-amplitude-mode",
+        choices=["fixed", "fit_per_direction"],
+        default="fixed",
+        help="Use fixed --incident-amplitude or fit one complex incident amplitude per direction.",
+    )
     parser.add_argument("--phase-sign", type=float, default=1.0)
     parser.add_argument(
         "--observation-imag-sign",
@@ -42,6 +61,9 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     )
     parser.add_argument("--noise-level", type=float, default=0.0)
     parser.add_argument("--eps-initial", type=float, default=1.35)
+    parser.add_argument("--eps-max", type=float, default=4.0)
+    parser.add_argument("--epsilon-parameterization", choices=["mlp", "pixel"], default="mlp")
+    parser.add_argument("--pixel-grid-size", type=int, default=128)
     parser.add_argument("--max-points-per-direction", type=int, default=836)
     parser.add_argument("--data-batch-per-direction", type=int, default=256)
     parser.add_argument("--n-pde", type=int, default=1280)
@@ -54,6 +76,11 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--resume-checkpoint", default=None)
+    parser.add_argument(
+        "--resume-epsilon-from",
+        default=None,
+        help="Load only epsilon_branch parameters from a checkpoint; field_branch stays freshly initialized.",
+    )
     parser.add_argument("--no-robust-data", action="store_true")
     parser.add_argument("--diagnose-imag-sign", action="store_true")
     parser.add_argument("--weight-data", type=float, default=120.0)
@@ -62,6 +89,17 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--weight-integral-data", type=float, default=500.0)
     parser.add_argument("--weight-tv", type=float, default=0.006)
     parser.add_argument("--weight-contrast-l1", type=float, default=0.0)
+    parser.add_argument("--epsilon-binary-sharpen-weight", type=float, default=0.0)
+    parser.add_argument("--phase-binary-weight", type=float, default=0.0)
+    parser.add_argument("--pseudo-separation-weight", type=float, default=0.0)
+    parser.add_argument("--pseudo-separation-from", default=None)
+    parser.add_argument("--epsilon-prior-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--integral-internal-field-mode",
+        choices=["coupled", "detach_field", "incident_only"],
+        default="coupled",
+    )
+    parser.add_argument("--learn-integral-alpha", action="store_true")
     parser.add_argument("--field-hidden-layers", type=int, default=5)
     parser.add_argument("--field-hidden-units", type=int, default=88)
     parser.add_argument("--eps-hidden-layers", type=int, default=5)
@@ -120,10 +158,13 @@ def run_optimized_austria(
     default_data_dir: Path,
     default_output_dir: str,
     description: str,
+    frequency_hz: float = 0.3e9,
+    output_base_dir: Path | None = None,
 ) -> None:
     args = build_parser(description).parse_args()
     data_dir = Path(args.data_dir).resolve() if args.data_dir else default_data_dir.resolve()
-    output_dir = default_data_dir / (args.output_dir or default_output_dir)
+    base_dir = output_base_dir if output_base_dir is not None else default_data_dir
+    output_dir = base_dir / (args.output_dir or default_output_dir)
 
     if not data_dir.exists():
         raise FileNotFoundError(
@@ -131,7 +172,6 @@ def run_optimized_austria(
             "Expected +x.txt, -x.txt, +y.txt and -y.txt in that directory."
         )
 
-    frequency_hz = 0.3e9
     if args.diagnose_imag_sign:
         diagnose_imaginary_sign(data_dir, frequency_hz, args.phase_sign)
         return
@@ -142,12 +182,18 @@ def run_optimized_austria(
         incident_amplitude=args.incident_amplitude,
         incident_phase_sign=args.phase_sign,
         observation_imag_sign=args.observation_imag_sign,
-        estimate_incident_amplitude=False,
+        estimate_incident_amplitude=args.incident_amplitude_mode == "fit_per_direction",
         eps_min=1.0,
-        eps_max=4.0,
+        eps_max=args.eps_max,
         eps_initial=args.eps_initial,
+        epsilon_parameterization=args.epsilon_parameterization,
+        pixel_grid_size=args.pixel_grid_size,
         epochs_adam=args.epochs,
         learning_rate=args.lr,
+        field_lr=args.field_lr,
+        epsilon_lr=args.epsilon_lr,
+        freeze_epsilon_steps=args.freeze_epsilon_steps,
+        freeze_field_branch=args.freeze_field_branch,
         device=args.device,
         dtype=args.dtype,
         max_points_per_direction=args.max_points_per_direction,
@@ -160,6 +206,7 @@ def run_optimized_austria(
         log_every=args.log_every,
         checkpoint_every=args.checkpoint_every,
         resume_checkpoint=args.resume_checkpoint,
+        resume_epsilon_from=args.resume_epsilon_from,
         robust_data_weighting=not args.no_robust_data,
         weight_data=args.weight_data,
         weight_pde=args.weight_pde,
@@ -167,6 +214,13 @@ def run_optimized_austria(
         weight_integral_data=args.weight_integral_data,
         weight_tv=args.weight_tv,
         weight_contrast_l1=args.weight_contrast_l1,
+        epsilon_binary_sharpen_weight=args.epsilon_binary_sharpen_weight,
+        phase_binary_weight=args.phase_binary_weight,
+        pseudo_separation_weight=args.pseudo_separation_weight,
+        pseudo_separation_from=args.pseudo_separation_from,
+        epsilon_prior_weight=args.epsilon_prior_weight,
+        integral_internal_field_mode=args.integral_internal_field_mode,
+        learn_integral_alpha=args.learn_integral_alpha,
         field_hidden_layers=args.field_hidden_layers,
         field_hidden_units=args.field_hidden_units,
         eps_hidden_layers=args.eps_hidden_layers,

@@ -56,6 +56,8 @@ class TrainConfig:
     eps_min: float = 1.0
     eps_max: float = 5.0
     eps_initial: float = 1.05
+    epsilon_parameterization: str = "mlp"
+    pixel_grid_size: int = 128
     domain_radius: Optional[float] = None
     max_points_per_direction: int = 1200
     data_batch_per_direction: int = 256
@@ -74,13 +76,19 @@ class TrainConfig:
     field_lr: Optional[float] = None
     epsilon_lr: Optional[float] = None
     freeze_epsilon_steps: int = 0
+    freeze_field_branch: bool = False
     weight_data: float = 100.0
     weight_pde: float = 0.004
     weight_boundary: float = 0.04
     weight_integral_data: float = 0.0
     weight_tv: float = 0.025
     weight_contrast_l1: float = 1.0e-3
+    weight_field_integral_consistency: float = 0.0
     binary_push_weight: float = 0.0
+    epsilon_binary_sharpen_weight: float = 0.0
+    phase_binary_weight: float = 0.0
+    pseudo_separation_weight: float = 0.0
+    pseudo_separation_from: Optional[str] = None
     epsilon_prior_weight: float = 0.0
     weight_edge_preserving: float = 0.0
     background_anchor_weight: float = 0.0
@@ -102,6 +110,8 @@ class TrainConfig:
     fourier_bands: int = 5
     fourier_max_frequency: float = 8.0
     integral_grid_size: int = 32
+    integral_internal_field_mode: str = "coupled"
+    learn_integral_alpha: bool = False
     plot_grid_size: int = 220
     log_every: int = 100
     checkpoint_every: int = 2000
@@ -293,7 +303,8 @@ def load_observations(
         print(
             f"{label}: mean|total|={np.mean(np.abs(total)):.6e}, "
             f"mean|incident|={np.mean(np.abs(inc)):.6e}, "
-            f"mean|scattered|={np.mean(np.abs(scattered)):.6e}",
+            f"mean|scattered|={np.mean(np.abs(scattered)):.6e}, "
+            f"incident_amp={amplitude.real:+.8e}{amplitude.imag:+.8e}j",
             flush=True,
         )
         if config.noise_level > 0:
@@ -508,17 +519,131 @@ class EpsilonBranch(nn.Module):
         background = torch.full_like(eps, float(self.eps_background))
         return torch.where(inside, eps, background)
 
+
+class FixedContrastMaskEpsilonBranch(nn.Module):
+    def __init__(self, config: TrainConfig, target: TargetSpec) -> None:
+        super().__init__()
+        self.eps_background = float(target.eps_background)
+        self.eps_object = float(target.eps_object)
+        self.roi_half_width = target.roi_half_width
+        self.spatial_features = FourierFeatureMap(
+            input_dim=2,
+            num_bands=config.fourier_bands,
+            max_frequency=config.fourier_max_frequency,
+            include_input=True,
+        )
+        self.mlp = MLP(
+            input_dim=self.spatial_features.output_dim,
+            output_dim=1,
+            hidden_layers=config.eps_hidden_layers,
+            hidden_units=config.eps_hidden_units,
+            activation="silu",
+        )
+        denom = max(self.eps_object - self.eps_background, 1.0e-12)
+        p = (config.eps_initial - self.eps_background) / denom
+        p = min(max(p, 1e-5), 1.0 - 1e-5)
+        final_layer = self.mlp.net[-1]
+        if isinstance(final_layer, nn.Linear):
+            nn.init.zeros_(final_layer.weight)
+            nn.init.constant_(final_layer.bias, math.log(p / (1.0 - p)))
+
+    def mask(self, xy: "torch.Tensor") -> "torch.Tensor":
+        xy_scaled = xy / self.roi_half_width
+        raw = self.mlp(self.spatial_features(xy_scaled))
+        mask = torch.sigmoid(raw)
+        inside = torch.max(torch.abs(xy), dim=1, keepdim=True).values <= self.roi_half_width
+        return torch.where(inside, mask, torch.zeros_like(mask))
+
+    def forward(self, xy: "torch.Tensor") -> "torch.Tensor":
+        mask = self.mask(xy)
+        return self.eps_background + (self.eps_object - self.eps_background) * mask
+
+    def regularization_value(self, xy: "torch.Tensor") -> "torch.Tensor":
+        return self.mask(xy)
+
+
+class PixelEpsilonBranch(nn.Module):
+    def __init__(self, config: TrainConfig, target: TargetSpec) -> None:
+        super().__init__()
+        self.eps_min = config.eps_min
+        self.eps_max = config.eps_max
+        self.eps_background = target.eps_background
+        self.roi_half_width = target.roi_half_width
+        self.grid_size = int(config.pixel_grid_size)
+        if self.grid_size < 2:
+            raise ValueError("pixel_grid_size must be at least 2.")
+        p = (config.eps_initial - config.eps_min) / (config.eps_max - config.eps_min)
+        p = min(max(p, 1e-5), 1.0 - 1e-5)
+        init_logit = math.log(p / (1.0 - p))
+        self.logits = nn.Parameter(torch.full((1, 1, self.grid_size, self.grid_size), float(init_logit)))
+
+    def forward(self, xy: "torch.Tensor") -> "torch.Tensor":
+        # PDE residuals differentiate the field with respect to xy, but do not
+        # require epsilon derivatives. Detaching avoids unsupported second
+        # derivatives through grid_sample while keeping gradients to logits.
+        norm = xy.detach() / self.roi_half_width
+        sample_grid = norm.reshape(1, -1, 1, 2)
+        raw = torch.nn.functional.grid_sample(
+            self.logits,
+            sample_grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        ).reshape(-1, 1)
+        eps = self.eps_min + (self.eps_max - self.eps_min) * torch.sigmoid(raw)
+        inside = torch.max(torch.abs(xy), dim=1, keepdim=True).values <= self.roi_half_width
+        background = torch.full_like(eps, float(self.eps_background))
+        return torch.where(inside, eps, background)
+
+
 class DoubleBranchPINN(nn.Module):
     def __init__(self, config: TrainConfig, target: TargetSpec) -> None:
         super().__init__()
         self.field_branch = FieldBranch(config, target.roi_half_width)
-        self.epsilon_branch = EpsilonBranch(config, target)
+        if config.epsilon_parameterization == "mlp":
+            self.epsilon_branch = EpsilonBranch(config, target)
+        elif config.epsilon_parameterization == "pixel":
+            self.epsilon_branch = PixelEpsilonBranch(config, target)
+        elif config.epsilon_parameterization == "fixed_contrast_mask":
+            self.epsilon_branch = FixedContrastMaskEpsilonBranch(config, target)
+        else:
+            raise ValueError(f"Unsupported epsilon_parameterization: {config.epsilon_parameterization}")
 
     def scattered_field(self, xy: "torch.Tensor", directions: "torch.Tensor") -> "torch.Tensor":
         return self.field_branch(xy, directions)
 
     def epsilon(self, xy: "torch.Tensor") -> "torch.Tensor":
         return self.epsilon_branch(xy)
+
+    def epsilon_regularization_value(self, xy: "torch.Tensor") -> "torch.Tensor":
+        fn = getattr(self.epsilon_branch, "regularization_value", None)
+        if fn is None:
+            return self.epsilon(xy)
+        return fn(xy)
+
+
+def attach_integral_alpha(
+    model: DoubleBranchPINN,
+    n_directions: int,
+    device: "torch.device",
+    dtype: "torch.dtype",
+) -> None:
+    initial = torch.zeros(n_directions, 2, device=device, dtype=dtype)
+    initial[:, 0] = 1.0
+    model.integral_alpha = nn.Parameter(initial)
+
+
+def integral_alpha_summary(model: DoubleBranchPINN, labels: Sequence[str]) -> str:
+    alpha = getattr(model, "integral_alpha", None)
+    if alpha is None:
+        return "integral alpha disabled"
+    vals = alpha.detach().cpu().numpy()
+    parts = []
+    for idx, value in enumerate(vals):
+        label = labels[idx] if idx < len(labels) else str(idx)
+        z = complex(float(value[0]), float(value[1]))
+        parts.append(f"{label}: {abs(z):.6f} @ {math.degrees(math.atan2(z.imag, z.real)):.3f} deg")
+    return "; ".join(parts)
 
 
 def load_epsilon_branch_only(
@@ -646,6 +771,13 @@ def robust_mse(diff: "torch.Tensor") -> "torch.Tensor":
     return torch.mean(weights * torch.sum(diff.square(), dim=1, keepdim=True))
 
 
+def epsilon_regularization_value(model: DoubleBranchPINN, xy: "torch.Tensor") -> "torch.Tensor":
+    fn = getattr(model, "epsilon_regularization_value", None)
+    if fn is None:
+        return model.epsilon(xy)
+    return fn(xy)
+
+
 def data_loss(
     model: DoubleBranchPINN,
     xy: "torch.Tensor",
@@ -689,7 +821,7 @@ def total_variation_loss(
     ys = torch.linspace(-target.roi_half_width, target.roi_half_width, n_grid, device=device, dtype=dtype)
     yy, xx = torch.meshgrid(ys, xs, indexing="ij")
     xy = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
-    eps = model.epsilon(xy).reshape(n_grid, n_grid)
+    eps = epsilon_regularization_value(model, xy).reshape(n_grid, n_grid)
     dx = eps[:, 1:] - eps[:, :-1]
     dy = eps[1:, :] - eps[:-1, :]
     beta = torch.as_tensor(1e-1, dtype=dtype, device=device)
@@ -726,7 +858,7 @@ def contrast_l1_loss(
     dtype: "torch.dtype",
 ) -> "torch.Tensor":
     xy = (2.0 * torch.rand(n_points, 2, device=device, dtype=dtype) - 1.0) * target.roi_half_width
-    eps = model.epsilon(xy)
+    eps = epsilon_regularization_value(model, xy)
     return torch.mean(torch.abs(eps - target.eps_background))
 
 
@@ -741,6 +873,62 @@ def binary_push_loss(
     eps = model.epsilon(xy)
     penalty = (eps - target.eps_background) * (target.eps_object - eps)
     return torch.mean(torch.clamp(penalty, min=0.0))
+
+
+def epsilon_binary_sharpen_loss(
+    model: DoubleBranchPINN,
+    target: TargetSpec,
+    n_points: int,
+    device: "torch.device",
+    dtype: "torch.dtype",
+) -> "torch.Tensor":
+    xy = (2.0 * torch.rand(n_points, 2, device=device, dtype=dtype) - 1.0) * target.roi_half_width
+    eps = model.epsilon(xy)
+    in_range = (eps >= 1.0) & (eps <= 4.0)
+    penalty = (eps - 1.0) * (4.0 - eps)
+    return torch.mean(torch.where(in_range, penalty, torch.zeros_like(penalty)))
+
+
+def phase_binary_loss(
+    model: DoubleBranchPINN,
+    target: TargetSpec,
+    n_points: int,
+    device: "torch.device",
+    dtype: "torch.dtype",
+) -> "torch.Tensor":
+    xy = (2.0 * torch.rand(n_points, 2, device=device, dtype=dtype) - 1.0) * target.roi_half_width
+    eps = model.epsilon(xy)
+    denom = max(target.eps_object - target.eps_background, 1.0e-12)
+    m = torch.clamp((eps - target.eps_background) / denom, 0.0, 1.0)
+    return torch.mean(m.square() * (1.0 - m).square())
+
+
+def pseudo_separation_loss(
+    model: DoubleBranchPINN,
+    pseudo_branch: Optional[nn.Module],
+    target: TargetSpec,
+    n_points: int,
+    device: "torch.device",
+    dtype: "torch.dtype",
+) -> "torch.Tensor":
+    if pseudo_branch is None:
+        return torch.zeros((), dtype=dtype, device=device)
+    xy = (2.0 * torch.rand(n_points, 2, device=device, dtype=dtype) - 1.0) * target.roi_half_width
+    eps = model.epsilon(xy)
+    with torch.no_grad():
+        eps_ref = pseudo_branch(xy)
+        target_core = eps_ref > 2.4
+        background_core = eps_ref < 1.2
+        mask = target_core | background_core
+        pseudo_target = torch.where(
+            target_core,
+            torch.full_like(eps_ref, target.eps_object),
+            torch.full_like(eps_ref, target.eps_background),
+        )
+    penalty = (eps - pseudo_target).square()
+    if not bool(mask.any()):
+        return torch.zeros((), dtype=dtype, device=device)
+    return torch.mean(penalty[mask])
 
 
 def epsilon_prior_loss(
@@ -881,19 +1069,19 @@ def make_integral_tensors(
     )
 
 
-def volume_integral_data_loss(
+def volume_integral_receiver_prediction(
     model: DoubleBranchPINN,
     data_indices: "torch.Tensor",
     data_dirs: "torch.Tensor",
-    data_target: "torch.Tensor",
     integral: IntegralTensors,
     obs_tensors: ObservationTensors,
     target: TargetSpec,
     config: TrainConfig,
-) -> "torch.Tensor":
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
     eps = model.epsilon(integral.quad_xy)
     contrast = eps - float(target.eps_background)
-    losses = []
+    pred_parts = []
+    order_parts = []
     k2_area = (config.k0**2) * integral.area_weight
 
     for dir_idx in range(obs_tensors.unique_directions.shape[0]):
@@ -906,7 +1094,6 @@ def volume_integral_data_loss(
         quad_amps = obs_tensors.unique_amplitudes[dir_idx : dir_idx + 1].expand(
             integral.quad_xy.shape[0], 2
         )
-        scattered_quad = model.scattered_field(integral.quad_xy, quad_dirs)
         inc_re, inc_im = incident_field_torch(
             integral.quad_xy,
             quad_dirs,
@@ -914,8 +1101,19 @@ def volume_integral_data_loss(
             quad_amps,
             config.incident_phase_sign,
         )
-        total_re = inc_re + scattered_quad[:, 0:1]
-        total_im = inc_im + scattered_quad[:, 1:2]
+        if config.integral_internal_field_mode == "incident_only":
+            total_re = inc_re
+            total_im = inc_im
+        else:
+            scattered_quad = model.scattered_field(integral.quad_xy, quad_dirs)
+            if config.integral_internal_field_mode == "detach_field":
+                scattered_quad = scattered_quad.detach()
+            elif config.integral_internal_field_mode != "coupled":
+                raise ValueError(
+                    "integral_internal_field_mode must be one of: coupled, detach_field, incident_only"
+                )
+            total_re = inc_re + scattered_quad[:, 0:1]
+            total_im = inc_im + scattered_quad[:, 1:2]
         source_re = (k2_area * contrast * total_re).squeeze(1)
         source_im = (k2_area * contrast * total_im).squeeze(1)
 
@@ -923,13 +1121,71 @@ def volume_integral_data_loss(
         green_im = integral.green_im[data_indices[mask]]
         pred_re = torch.matmul(green_re, source_re) - torch.matmul(green_im, source_im)
         pred_im = torch.matmul(green_re, source_im) + torch.matmul(green_im, source_re)
-        pred = torch.stack((pred_re, pred_im), dim=1)
-        diff = pred - data_target[mask]
-        losses.append(torch.mean(torch.sum(diff.square(), dim=1, keepdim=True)))
+        if config.learn_integral_alpha:
+            alpha = getattr(model, "integral_alpha", None)
+            if alpha is None:
+                raise ValueError("learn_integral_alpha is enabled, but model.integral_alpha is not initialized.")
+            alpha_re = alpha[dir_idx, 0]
+            alpha_im = alpha[dir_idx, 1]
+            corrected_re = alpha_re * pred_re - alpha_im * pred_im
+            corrected_im = alpha_re * pred_im + alpha_im * pred_re
+            pred_re, pred_im = corrected_re, corrected_im
+        pred_parts.append(torch.stack((pred_re, pred_im), dim=1))
+        order_parts.append(torch.nonzero(mask, as_tuple=False).squeeze(1))
 
+    if not pred_parts:
+        empty_pred = torch.empty((0, 2), dtype=integral.quad_xy.dtype, device=integral.quad_xy.device)
+        empty_order = torch.empty((0,), dtype=torch.long, device=integral.quad_xy.device)
+        return empty_pred, empty_order
+    return torch.cat(pred_parts, dim=0), torch.cat(order_parts, dim=0)
+
+
+def volume_integral_data_loss(
+    model: DoubleBranchPINN,
+    data_indices: "torch.Tensor",
+    data_dirs: "torch.Tensor",
+    data_target: "torch.Tensor",
+    integral: IntegralTensors,
+    obs_tensors: ObservationTensors,
+    target: TargetSpec,
+    config: TrainConfig,
+) -> "torch.Tensor":
+    pred, order = volume_integral_receiver_prediction(
+        model, data_indices, data_dirs, integral, obs_tensors, target, config
+    )
+    if pred.numel() == 0:
+        return torch.zeros((), dtype=integral.quad_xy.dtype, device=integral.quad_xy.device)
+    diff = pred - data_target[order]
+    per_point = torch.sum(diff.square(), dim=1, keepdim=True)
+    losses = []
+    ordered_dirs = data_dirs[order]
+    for direction in obs_tensors.unique_directions:
+        mask = torch.all(ordered_dirs == direction, dim=1)
+        if torch.any(mask):
+            losses.append(torch.mean(per_point[mask]))
     if not losses:
         return torch.zeros((), dtype=integral.quad_xy.dtype, device=integral.quad_xy.device)
     return torch.stack(losses).mean()
+
+
+def field_integral_consistency_loss(
+    model: DoubleBranchPINN,
+    data_xy: "torch.Tensor",
+    data_indices: "torch.Tensor",
+    data_dirs: "torch.Tensor",
+    integral: IntegralTensors,
+    obs_tensors: ObservationTensors,
+    target: TargetSpec,
+    config: TrainConfig,
+) -> "torch.Tensor":
+    integral_pred, order = volume_integral_receiver_prediction(
+        model, data_indices, data_dirs, integral, obs_tensors, target, config
+    )
+    if integral_pred.numel() == 0:
+        return torch.zeros((), dtype=integral.quad_xy.dtype, device=integral.quad_xy.device)
+    field_pred = model.scattered_field(data_xy[order], data_dirs[order])
+    diff = field_pred - integral_pred
+    return torch.mean(torch.sum(diff.square(), dim=1, keepdim=True))
 
 
 def target_mask(target: TargetSpec, x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -1059,6 +1315,8 @@ EVALUATION_FIELDNAMES = [
     "epoch",
     "total_loss",
     "data_loss",
+    "integral_data_loss",
+    "field_integral_consistency_loss",
     "pde_loss",
     "boundary_loss",
     "tv_loss",
@@ -1084,6 +1342,10 @@ def make_evaluation_row(
         "epoch": int(epoch),
         "total_loss": float(loss_items.get("total", float("nan"))),
         "data_loss": float(loss_items.get("data", float("nan"))),
+        "integral_data_loss": float(loss_items.get("integral_data", float("nan"))),
+        "field_integral_consistency_loss": float(
+            loss_items.get("field_integral_consistency", float("nan"))
+        ),
         "pde_loss": float(loss_items.get("pde", float("nan"))),
         "boundary_loss": float(loss_items.get("boundary", float("nan"))),
         "tv_loss": float(loss_items.get("tv", float("nan"))),
@@ -1272,19 +1534,32 @@ def compute_loss_terms(
     dtype: "torch.dtype",
     epsilon_prior_branch: Optional[nn.Module] = None,
     background_anchor_branch: Optional[nn.Module] = None,
+    pseudo_separation_branch: Optional[nn.Module] = None,
 ) -> Dict[str, "torch.Tensor"]:
     loss_data = data_loss(model, data_xy, data_dirs, data_target, robust=config.robust_data_weighting)
     loss_pde = pde_residual_loss(model, pde_xy, pde_dirs, pde_amps, config)
     loss_boundary = sommerfeld_boundary_loss(model, bc_xy, bc_dirs, config)
     if integral_tensors is None:
         loss_integral = torch.zeros((), dtype=dtype, device=device)
+        loss_field_integral = torch.zeros((), dtype=dtype, device=device)
     else:
         loss_integral = volume_integral_data_loss(
             model, data_indices, data_dirs, data_target, integral_tensors, obs_tensors, target, config
         )
+        if config.weight_field_integral_consistency > 0.0 and config.loss_preset == "current":
+            loss_field_integral = field_integral_consistency_loss(
+                model, data_xy, data_indices, data_dirs, integral_tensors, obs_tensors, target, config
+            )
+        else:
+            loss_field_integral = torch.zeros((), dtype=dtype, device=device)
     loss_tv = total_variation_loss(model, target, config.n_tv_grid, device, dtype)
     loss_l1 = contrast_l1_loss(model, target, 1024, device, dtype)
     loss_binary_push = binary_push_loss(model, target, 1024, device, dtype)
+    loss_epsilon_binary_sharpen = epsilon_binary_sharpen_loss(model, target, 1024, device, dtype)
+    loss_phase_binary = phase_binary_loss(model, target, 1024, device, dtype)
+    loss_pseudo_separation = pseudo_separation_loss(
+        model, pseudo_separation_branch, target, 1024, device, dtype
+    )
     loss_epsilon_prior = epsilon_prior_loss(
         model, epsilon_prior_branch, target, 1024, device, dtype
     )
@@ -1297,9 +1572,12 @@ def compute_loss_terms(
         device,
         dtype,
     )
-    loss_lep = edge_preserving_loss(model, target, config.n_tv_grid, device, dtype, config.edge_delta)
+    if config.weight_edge_preserving > 0.0 or config.loss_preset in ("paper", "paper_plus_integral"):
+        loss_lep = edge_preserving_loss(model, target, config.n_tv_grid, device, dtype, config.edge_delta)
+    else:
+        loss_lep = torch.zeros((), dtype=dtype, device=device)
     loss_lf = loss_pde + loss_boundary
-    if config.loss_preset == "paper":
+    if config.loss_preset in ("paper", "paper_plus_integral"):
         loss_ldw = paper_weighted_data_loss(
             model,
             data_xy,
@@ -1309,6 +1587,8 @@ def compute_loss_terms(
             delta=config.adaptive_delta,
         )
         total = config.lambda_f * loss_lf + config.lambda_d * loss_ldw + config.lambda_ep * loss_lep
+        if config.loss_preset == "paper_plus_integral":
+            total = total + config.weight_integral_data * loss_integral
     else:
         loss_ldw = torch.zeros((), dtype=dtype, device=device)
         total = (
@@ -1316,9 +1596,13 @@ def compute_loss_terms(
             + config.weight_pde * loss_pde
             + config.weight_boundary * loss_boundary
             + config.weight_integral_data * loss_integral
+            + config.weight_field_integral_consistency * loss_field_integral
             + config.weight_tv * loss_tv
             + config.weight_contrast_l1 * loss_l1
             + config.binary_push_weight * loss_binary_push
+            + config.epsilon_binary_sharpen_weight * loss_epsilon_binary_sharpen
+            + config.phase_binary_weight * loss_phase_binary
+            + config.pseudo_separation_weight * loss_pseudo_separation
             + config.epsilon_prior_weight * loss_epsilon_prior
             + config.weight_edge_preserving * loss_lep
             + config.background_anchor_weight * loss_background_anchor
@@ -1327,11 +1611,15 @@ def compute_loss_terms(
         "total": total,
         "data": loss_data,
         "integral_data": loss_integral,
+        "field_integral_consistency": loss_field_integral,
         "pde": loss_pde,
         "boundary": loss_boundary,
         "tv": loss_tv,
         "contrast_l1": loss_l1,
         "binary_push": loss_binary_push,
+        "epsilon_binary_sharpen": loss_epsilon_binary_sharpen,
+        "phase_binary": loss_phase_binary,
+        "pseudo_separation": loss_pseudo_separation,
         "epsilon_prior": loss_epsilon_prior,
         "background_anchor": loss_background_anchor,
         "lf": loss_lf,
@@ -1373,18 +1661,27 @@ def train_double_branch_pinn_from_observations(
     radius = config.domain_radius or obs.receiver_radius * 0.98
 
     model = DoubleBranchPINN(config, target).to(device=device, dtype=dtype)
+    if config.learn_integral_alpha:
+        attach_integral_alpha(model, obs_tensors.unique_directions.shape[0], device, dtype)
+        print(f"Integral alpha initial: {integral_alpha_summary(model, obs.direction_labels)}", flush=True)
     resume_step = 0
     if config.resume_checkpoint and config.resume_epsilon_from:
         raise ValueError("--resume-checkpoint and --resume-epsilon-from cannot be used together.")
     if config.resume_checkpoint:
         checkpoint = torch.load(config.resume_checkpoint, map_location=device, weights_only=False)
         checkpoint_model = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
-        model.load_state_dict(checkpoint_model)
+        model.load_state_dict(checkpoint_model, strict=not config.learn_integral_alpha)
         if isinstance(checkpoint, dict):
             resume_step = int(checkpoint.get("step", 0) or 0)
         print(f"Loaded checkpoint: {config.resume_checkpoint}", flush=True)
+        if config.learn_integral_alpha:
+            print(f"Integral alpha after load: {integral_alpha_summary(model, obs.direction_labels)}", flush=True)
     elif config.resume_epsilon_from:
         load_epsilon_branch_only(model, config.resume_epsilon_from, device)
+    if config.freeze_field_branch:
+        for param in model.field_branch.parameters():
+            param.requires_grad_(False)
+        print("field_branch frozen; optimizing epsilon_branch only", flush=True)
     epsilon_prior_branch: Optional[nn.Module] = None
     if config.epsilon_prior_weight > 0.0:
         epsilon_prior_branch = copy.deepcopy(model.epsilon_branch).to(device=device, dtype=dtype)
@@ -1414,6 +1711,23 @@ def train_double_branch_pinn_from_observations(
             f"(threshold={config.background_anchor_threshold:g})",
             flush=True,
         )
+    pseudo_separation_branch: Optional[nn.Module] = None
+    if config.pseudo_separation_weight > 0.0:
+        pseudo_source = config.pseudo_separation_from or config.resume_checkpoint
+        if not pseudo_source:
+            raise ValueError("--pseudo-separation-from or --resume-checkpoint is required when pseudo separation is enabled.")
+        pseudo_checkpoint = torch.load(pseudo_source, map_location=device, weights_only=False)
+        pseudo_model = (
+            pseudo_checkpoint["model"]
+            if isinstance(pseudo_checkpoint, dict) and "model" in pseudo_checkpoint
+            else pseudo_checkpoint
+        )
+        pseudo_separation_branch = copy.deepcopy(model.epsilon_branch).to(device=device, dtype=dtype)
+        pseudo_separation_branch.load_state_dict(extract_epsilon_branch_state(pseudo_model, pseudo_source))
+        pseudo_separation_branch.eval()
+        for param in pseudo_separation_branch.parameters():
+            param.requires_grad_(False)
+        print(f"pseudo separation mask initialized from {pseudo_source}", flush=True)
     metadata = {
         "target": asdict(target),
         "config": asdict(config),
@@ -1442,13 +1756,17 @@ def train_double_branch_pinn_from_observations(
         config.field_lr is not None
         or config.epsilon_lr is not None
         or config.freeze_epsilon_steps > 0
+        or config.freeze_field_branch
     )
     if use_split_lrs:
-        field_base_lr = config.field_lr if config.field_lr is not None else config.learning_rate
+        field_base_lr = 0.0 if config.freeze_field_branch else (
+            config.field_lr if config.field_lr is not None else config.learning_rate
+        )
         epsilon_base_lr = config.epsilon_lr if config.epsilon_lr is not None else config.learning_rate
+        field_params = [p for p in model.field_branch.parameters() if p.requires_grad]
         optimizer_adam = torch.optim.Adam(
             [
-                {"params": model.field_branch.parameters(), "lr": field_base_lr, "name": "field"},
+                {"params": field_params, "lr": field_base_lr, "name": "field"},
                 {"params": model.epsilon_branch.parameters(), "lr": epsilon_base_lr, "name": "epsilon"},
             ]
         )
@@ -1471,7 +1789,9 @@ def train_double_branch_pinn_from_observations(
 
     for step in range(1, config.epochs_adam + 1):
         if use_split_lrs:
-            field_base_lr = config.field_lr if config.field_lr is not None else config.learning_rate
+            field_base_lr = 0.0 if config.freeze_field_branch else (
+                config.field_lr if config.field_lr is not None else config.learning_rate
+            )
             epsilon_base_lr = config.epsilon_lr if config.epsilon_lr is not None else config.learning_rate
             remaining_eps_steps = max(config.epochs_adam - config.freeze_epsilon_steps, 1)
             for group in optimizer_adam.param_groups:
@@ -1517,6 +1837,7 @@ def train_double_branch_pinn_from_observations(
             dtype=dtype,
             epsilon_prior_branch=epsilon_prior_branch,
             background_anchor_branch=background_anchor_branch,
+            pseudo_separation_branch=pseudo_separation_branch,
         )
         total = losses["total"]
 
@@ -1531,11 +1852,15 @@ def train_double_branch_pinn_from_observations(
             "total": float(total.detach().cpu()),
             "data": float(losses["data"].detach().cpu()),
             "integral_data": float(losses["integral_data"].detach().cpu()),
+            "field_integral_consistency": float(losses["field_integral_consistency"].detach().cpu()),
             "pde": float(losses["pde"].detach().cpu()),
             "boundary": float(losses["boundary"].detach().cpu()),
             "tv": float(losses["tv"].detach().cpu()),
             "contrast_l1": float(losses["contrast_l1"].detach().cpu()),
             "binary_push": float(losses["binary_push"].detach().cpu()),
+            "epsilon_binary_sharpen": float(losses["epsilon_binary_sharpen"].detach().cpu()),
+            "phase_binary": float(losses["phase_binary"].detach().cpu()),
+            "pseudo_separation": float(losses["pseudo_separation"].detach().cpu()),
             "epsilon_prior": float(losses["epsilon_prior"].detach().cpu()),
             "background_anchor": float(losses["background_anchor"].detach().cpu()),
             "lf": float(losses["lf"].detach().cpu()),
@@ -1558,7 +1883,26 @@ def train_double_branch_pinn_from_observations(
         # Log metrics and save checkpoints on the existing schedule.
         should_log = step == 1 or step % config.log_every == 0
         if should_log or checkpoint_due:
-            _, _, _, _, _, metric_items = evaluate_epsilon_reconstruction(model, target, config, device, dtype)
+            x_eval, y_eval, pred_eval, truth_eval, _, metric_items = evaluate_epsilon_reconstruction(
+                model, target, config, device, dtype
+            )
+            object_mask_eval = target_mask(target, x_eval, y_eval)
+            if np.any(object_mask_eval):
+                square_mean = float(np.mean(pred_eval[object_mask_eval]))
+                square_max = float(np.max(pred_eval[object_mask_eval]))
+            else:
+                square_mean = float("nan")
+                square_max = float("nan")
+            if checkpoint_due:
+                plot_comparison(
+                    x_eval,
+                    y_eval,
+                    truth_eval,
+                    pred_eval,
+                    target,
+                    output_dir / f"comparison_adam_{global_step:06d}.png",
+                    title=f"{config.frequency_hz / 1e9:.1f} GHz",
+                )
             evaluation_history.append(
                 make_evaluation_row(
                     epoch=global_step,
@@ -1574,11 +1918,16 @@ def train_double_branch_pinn_from_observations(
                 "ssim_continuous": metric_items["ssim_continuous"],
                 "rel_error_thresholded": metric_items["rel_error_thresholded"],
                 "ssim_thresholded": metric_items["ssim_thresholded"],
+                "eps_min": float(np.min(pred_eval)),
+                "eps_max": float(np.max(pred_eval)),
+                "eps_mean": float(np.mean(pred_eval)),
+                "square_mean": square_mean,
+                "square_max": square_max,
                 "elapsed_s": float(time.time() - start_time),
             }
             history.append(row)
             if should_log:
-                if config.loss_preset == "paper":
+                if config.loss_preset in ("paper", "paper_plus_integral"):
                     print(
                         "Adam step={step:6.0f} total={total:.4e} lf={lf:.4e} "
                         "ldw={ldw:.4e} lep={lep:.4e} "
@@ -1588,8 +1937,10 @@ def train_double_branch_pinn_from_observations(
                 else:
                     print(
                         "Adam step={step:6.0f} total={total:.4e} data={data:.4e} "
-                        "int={integral_data:.4e} pde={pde:.4e} "
+                        "int={integral_data:.4e} fic={field_integral_consistency:.4e} pde={pde:.4e} "
                         "bc={boundary:.4e} tv={tv:.4e} "
+                        "eps=[{eps_min:.3f},{eps_max:.3f},{eps_mean:.3f}] "
+                        "sq=[{square_mean:.3f},{square_max:.3f}] "
                         "rel={rel_error_continuous:.4f} rel_thr={rel_error_thresholded:.4f}".format(**row),
                         flush=True,
                     )
@@ -1642,6 +1993,7 @@ def train_double_branch_pinn_from_observations(
                     dtype=dtype,
                     epsilon_prior_branch=epsilon_prior_branch,
                     background_anchor_branch=background_anchor_branch,
+                    pseudo_separation_branch=pseudo_separation_branch,
                 )
                 total = losses["total"]
                 total.backward()
@@ -1649,11 +2001,17 @@ def train_double_branch_pinn_from_observations(
                     {
                         "data": float(losses["data"].detach().cpu()),
                         "integral_data": float(losses["integral_data"].detach().cpu()),
+                        "field_integral_consistency": float(
+                            losses["field_integral_consistency"].detach().cpu()
+                        ),
                         "pde": float(losses["pde"].detach().cpu()),
                         "boundary": float(losses["boundary"].detach().cpu()),
                         "tv": float(losses["tv"].detach().cpu()),
                         "contrast_l1": float(losses["contrast_l1"].detach().cpu()),
                         "binary_push": float(losses["binary_push"].detach().cpu()),
+                        "epsilon_binary_sharpen": float(losses["epsilon_binary_sharpen"].detach().cpu()),
+                        "phase_binary": float(losses["phase_binary"].detach().cpu()),
+                        "pseudo_separation": float(losses["pseudo_separation"].detach().cpu()),
                         "epsilon_prior": float(losses["epsilon_prior"].detach().cpu()),
                         "background_anchor": float(losses["background_anchor"].detach().cpu()),
                         "lf": float(losses["lf"].detach().cpu()),
@@ -1701,7 +2059,7 @@ def train_double_branch_pinn_from_observations(
                     "elapsed_s": float(time.time() - start_time),
                 }
                 history.append(row)
-                if config.loss_preset == "paper":
+                if config.loss_preset in ("paper", "paper_plus_integral"):
                     print(
                         "LBFGS step={step:6.0f} total={total:.4e} lf={lf:.4e} "
                         "ldw={ldw:.4e} lep={lep:.4e} "
@@ -1795,6 +2153,8 @@ def train_double_branch_pinn_from_observations(
     }
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
+    if config.learn_integral_alpha:
+        print(f"Integral alpha final: {integral_alpha_summary(model, obs.direction_labels)}", flush=True)
 
     plot_epsilon_image(
         x,
