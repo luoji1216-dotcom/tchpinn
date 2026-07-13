@@ -1,0 +1,5 @@
+result,role,continuous_re,continuous_ssim,best_threshold,best_threshold_re,best_threshold_ssim,square_min,square_mean,square_max,center_mean,center_max,edge_mean,background_mean,eps_max_exceeds_4,note
+TV+Lep 14k,thresholded structure best,0.213694,0.919121,2.32,0.062314,0.994544,1.861825,3.155735,3.396869,3.343505,3.396869,3.093146,1.047581,false,"Best thresholded structure, but epsilon amplitude is low."
+early metric,center-amplitude reference,0.238185,0.908110,1.64,0.151920,0.967426,1.287686,3.333007,4.134728,4.075866,4.134728,3.085387,1.024656,true,"Center epsilon is close to 4, but it overshoots and has weak edge / whole-object structure."
+E,current comprehensive best,0.171311,0.952462,2.20,0.106657,0.983925,1.585770,3.465424,3.934785,3.804970,3.909725,3.352242,1.035583,false,"Current formal main result: higher square mean, center close to 4 without overshoot, stable background, best continuous metric."
+G,edge-fill contrast,0.175957,0.950525,2.10,0.117164,0.980596,1.551311,3.489301,4.094863,3.853086,4.025705,3.368039,1.029852,true,"Edge and square mean improve over E, but eps max exceeds 4 and continuous/thresholded metrics are worse."

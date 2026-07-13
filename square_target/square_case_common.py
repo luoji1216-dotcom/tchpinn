@@ -60,6 +60,10 @@ def build_square_parser(description: str) -> argparse.ArgumentParser:
         default=0,
         help="Keep epsilon_branch Adam learning rate at zero for this many initial steps.",
     )
+    parser.add_argument("--field-hard-boundary", choices=["none", "outer_taper"], default="none")
+    parser.add_argument("--field-envelope-start-radius", type=float, default=None)
+    parser.add_argument("--field-envelope-outer-radius", type=float, default=None)
+    parser.add_argument("--pde-physical-radius", type=float, default=None)
     parser.add_argument("--incident-amplitude", type=float, default=0.1)
     parser.add_argument("--phase-sign", type=float, default=1.0)
     parser.add_argument("--eps-initial", type=float, default=1.5)
@@ -131,6 +135,10 @@ def build_square_parser(description: str) -> argparse.ArgumentParser:
         type=float,
         default=0.0,
     )
+    parser.add_argument("--weight-eps-binary", type=float, default=0.0)
+    parser.add_argument("--weight-eps-high-material", type=float, default=0.0)
+    parser.add_argument("--eps-high-threshold", type=float, default=0.55)
+    parser.add_argument("--eps-high-temperature", type=float, default=0.05)
     parser.add_argument("--binary-push-weight", type=float, default=0.0)
     parser.add_argument("--epsilon-prior-weight", type=float, default=0.0)
     parser.add_argument("--background-anchor-weight", type=float, default=0.0)
@@ -228,6 +236,7 @@ def run_square_case(
         eps_initial=args.eps_initial,
         epsilon_parameterization="mlp" if args.epsilon_param == "direct" else args.epsilon_param,
         domain_radius=args.domain_radius,
+        pde_physical_radius=args.pde_physical_radius,
         epochs_adam=args.epochs if args.epochs is not None else args.epochs_adam,
         epochs_lbfgs=0,
         lbfgs_steps=lbfgs_steps,
@@ -238,6 +247,9 @@ def run_square_case(
         field_lr=args.field_lr,
         epsilon_lr=args.epsilon_lr,
         freeze_epsilon_steps=args.freeze_epsilon_steps,
+        field_hard_boundary=args.field_hard_boundary,
+        field_envelope_start_radius=args.field_envelope_start_radius,
+        field_envelope_outer_radius=args.field_envelope_outer_radius,
         device=args.device,
         dtype=args.dtype,
         resume_checkpoint=args.resume_checkpoint,
@@ -267,6 +279,10 @@ def run_square_case(
         weight_tv=args.weight_tv,
         weight_edge_preserving=args.weight_edge_preserving,
         weight_contrast_l1=args.weight_contrast_l1,
+        weight_eps_binary=args.weight_eps_binary,
+        weight_eps_high_material=args.weight_eps_high_material,
+        eps_high_threshold=args.eps_high_threshold,
+        eps_high_temperature=args.eps_high_temperature,
         binary_push_weight=args.binary_push_weight,
         epsilon_prior_weight=args.epsilon_prior_weight,
         background_anchor_weight=args.background_anchor_weight,

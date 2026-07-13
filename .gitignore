@@ -7,6 +7,8 @@ __pycache__/
 *.npy
 *.npz
 *.csv
+!results_5_3_2_square_0_3GHz_final_recheck_summary.csv
+!results_5_3_2_square_0_3GHz_amplitude_recheck_summary.csv
 results*/
 austria_target/results*/
 austria_target/**/results*/

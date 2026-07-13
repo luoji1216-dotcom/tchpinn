@@ -59,6 +59,7 @@ class TrainConfig:
     epsilon_parameterization: str = "mlp"
     pixel_grid_size: int = 128
     domain_radius: Optional[float] = None
+    pde_physical_radius: Optional[float] = None
     max_points_per_direction: int = 1200
     data_batch_per_direction: int = 256
     n_pde: int = 2048
@@ -77,12 +78,19 @@ class TrainConfig:
     epsilon_lr: Optional[float] = None
     freeze_epsilon_steps: int = 0
     freeze_field_branch: bool = False
+    field_hard_boundary: str = "none"
+    field_envelope_start_radius: Optional[float] = None
+    field_envelope_outer_radius: Optional[float] = None
     weight_data: float = 100.0
     weight_pde: float = 0.004
     weight_boundary: float = 0.04
     weight_integral_data: float = 0.0
     weight_tv: float = 0.025
     weight_contrast_l1: float = 1.0e-3
+    weight_eps_binary: float = 0.0
+    weight_eps_high_material: float = 0.0
+    eps_high_threshold: float = 0.55
+    eps_high_temperature: float = 0.05
     weight_field_integral_consistency: float = 0.0
     binary_push_weight: float = 0.0
     epsilon_binary_sharpen_weight: float = 0.0
@@ -600,6 +608,9 @@ class DoubleBranchPINN(nn.Module):
     def __init__(self, config: TrainConfig, target: TargetSpec) -> None:
         super().__init__()
         self.field_branch = FieldBranch(config, target.roi_half_width)
+        self.field_hard_boundary = config.field_hard_boundary
+        self.field_envelope_start_radius = config.field_envelope_start_radius
+        self.field_envelope_outer_radius = config.field_envelope_outer_radius
         if config.epsilon_parameterization == "mlp":
             self.epsilon_branch = EpsilonBranch(config, target)
         elif config.epsilon_parameterization == "pixel":
@@ -610,7 +621,21 @@ class DoubleBranchPINN(nn.Module):
             raise ValueError(f"Unsupported epsilon_parameterization: {config.epsilon_parameterization}")
 
     def scattered_field(self, xy: "torch.Tensor", directions: "torch.Tensor") -> "torch.Tensor":
-        return self.field_branch(xy, directions)
+        raw = self.field_branch(xy, directions)
+        if self.field_hard_boundary == "outer_taper":
+            return self.field_envelope(xy) * raw
+        return raw
+
+    def field_envelope(self, xy: "torch.Tensor") -> "torch.Tensor":
+        if self.field_hard_boundary != "outer_taper":
+            return torch.ones((xy.shape[0], 1), dtype=xy.dtype, device=xy.device)
+        if self.field_envelope_start_radius is None or self.field_envelope_outer_radius is None:
+            raise ValueError("outer_taper field hard boundary requires start and outer radii.")
+        start = float(self.field_envelope_start_radius)
+        outer = float(self.field_envelope_outer_radius)
+        radius = torch.linalg.norm(xy, dim=1, keepdim=True)
+        t = ((radius - start) / (outer - start)).clamp(0.0, 1.0)
+        return 0.5 * (1.0 + torch.cos(math.pi * t))
 
     def epsilon(self, xy: "torch.Tensor") -> "torch.Tensor":
         return self.epsilon_branch(xy)
@@ -848,6 +873,49 @@ def edge_preserving_loss(
     grad_eps = torch.autograd.grad(eps.sum(), xy, create_graph=True, retain_graph=True)[0]
     delta = torch.as_tensor(edge_delta, dtype=dtype, device=device)
     return torch.mean(torch.sqrt(grad_eps[:, 0:1].square() + grad_eps[:, 1:2].square() + delta.square()))
+
+
+def eps_binary_material_loss(
+    model: DoubleBranchPINN,
+    target: TargetSpec,
+    n_grid: int,
+    device: "torch.device",
+    dtype: "torch.dtype",
+) -> "torch.Tensor":
+    if n_grid <= 0:
+        return torch.zeros((), dtype=dtype, device=device)
+    xs = torch.linspace(-target.roi_half_width, target.roi_half_width, n_grid, device=device, dtype=dtype)
+    ys = torch.linspace(-target.roi_half_width, target.roi_half_width, n_grid, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    xy = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
+    eps = epsilon_regularization_value(model, xy)
+    denom = max(target.eps_object - target.eps_background, 1.0e-12)
+    q = torch.clamp((eps - target.eps_background) / denom, 0.0, 1.0)
+    return torch.mean(q.square() * (1.0 - q).square())
+
+
+def eps_high_material_loss(
+    model: DoubleBranchPINN,
+    target: TargetSpec,
+    n_grid: int,
+    device: "torch.device",
+    dtype: "torch.dtype",
+    threshold: float,
+    temperature: float,
+) -> "torch.Tensor":
+    if n_grid <= 0:
+        return torch.zeros((), dtype=dtype, device=device)
+    if temperature <= 0.0:
+        raise ValueError("--eps-high-temperature must be positive.")
+    xs = torch.linspace(-target.roi_half_width, target.roi_half_width, n_grid, device=device, dtype=dtype)
+    ys = torch.linspace(-target.roi_half_width, target.roi_half_width, n_grid, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    xy = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
+    eps = epsilon_regularization_value(model, xy)
+    denom = max(target.eps_object - target.eps_background, 1.0e-12)
+    q = torch.clamp((eps - target.eps_background) / denom, 0.0, 1.0)
+    gate = torch.sigmoid((q - threshold) / temperature).detach()
+    return torch.sum(gate * (1.0 - q).square()) / (torch.sum(gate) + 1.0e-12)
 
 
 def contrast_l1_loss(
@@ -1553,6 +1621,19 @@ def compute_loss_terms(
         else:
             loss_field_integral = torch.zeros((), dtype=dtype, device=device)
     loss_tv = total_variation_loss(model, target, config.n_tv_grid, device, dtype)
+    loss_eps_binary = eps_binary_material_loss(model, target, config.n_tv_grid, device, dtype)
+    if config.weight_eps_high_material > 0.0:
+        loss_eps_high_material = eps_high_material_loss(
+            model,
+            target,
+            config.n_tv_grid,
+            device,
+            dtype,
+            config.eps_high_threshold,
+            config.eps_high_temperature,
+        )
+    else:
+        loss_eps_high_material = torch.zeros((), dtype=dtype, device=device)
     loss_l1 = contrast_l1_loss(model, target, 1024, device, dtype)
     loss_binary_push = binary_push_loss(model, target, 1024, device, dtype)
     loss_epsilon_binary_sharpen = epsilon_binary_sharpen_loss(model, target, 1024, device, dtype)
@@ -1599,6 +1680,8 @@ def compute_loss_terms(
             + config.weight_field_integral_consistency * loss_field_integral
             + config.weight_tv * loss_tv
             + config.weight_contrast_l1 * loss_l1
+            + config.weight_eps_binary * loss_eps_binary
+            + config.weight_eps_high_material * loss_eps_high_material
             + config.binary_push_weight * loss_binary_push
             + config.epsilon_binary_sharpen_weight * loss_epsilon_binary_sharpen
             + config.phase_binary_weight * loss_phase_binary
@@ -1616,6 +1699,8 @@ def compute_loss_terms(
         "boundary": loss_boundary,
         "tv": loss_tv,
         "contrast_l1": loss_l1,
+        "eps_binary": loss_eps_binary,
+        "eps_high_material": loss_eps_high_material,
         "binary_push": loss_binary_push,
         "epsilon_binary_sharpen": loss_epsilon_binary_sharpen,
         "phase_binary": loss_phase_binary,
@@ -1658,9 +1743,71 @@ def train_double_branch_pinn_from_observations(
 
     obs_tensors = to_observation_tensors(obs, device=device, dtype=dtype)
     integral_tensors = make_integral_tensors(obs, target, config, device=device, dtype=dtype)
-    radius = config.domain_radius or obs.receiver_radius * 0.98
+    domain_radius = config.domain_radius or obs.receiver_radius * 0.98
+    pde_radius = config.pde_physical_radius or domain_radius
 
     model = DoubleBranchPINN(config, target).to(device=device, dtype=dtype)
+    if config.field_hard_boundary not in ("none", "outer_taper"):
+        raise ValueError("field_hard_boundary must be one of: none, outer_taper")
+    if config.field_hard_boundary == "outer_taper":
+        start = config.field_envelope_start_radius
+        outer = config.field_envelope_outer_radius
+        if start is None or outer is None:
+            raise ValueError("outer_taper requires --field-envelope-start-radius and --field-envelope-outer-radius.")
+        if outer <= start:
+            raise ValueError("--field-envelope-outer-radius must be greater than --field-envelope-start-radius.")
+        if start <= obs.receiver_radius:
+            raise ValueError("--field-envelope-start-radius must be greater than receiver_radius.")
+        if config.pde_physical_radius is None:
+            pde_radius = float(start)
+        if pde_radius > start:
+            raise ValueError(
+                "--pde-physical-radius must be less than or equal to --field-envelope-start-radius "
+                "when --field-hard-boundary outer_taper is enabled."
+            )
+        sample_angles = torch.linspace(0.0, 2.0 * math.pi, 64, device=device, dtype=dtype)
+        print(
+            f"field_hard_boundary=outer_taper R_start={start:g} R_outer={outer:g}",
+            flush=True,
+        )
+        print(
+            "radii: "
+            f"receiver_radius={obs.receiver_radius:g} "
+            f"field_envelope_start_radius={float(start):g} "
+            f"field_envelope_outer_radius={float(outer):g} "
+            f"domain_radius={domain_radius:g} "
+            f"pde_physical_radius={pde_radius:g}",
+            flush=True,
+        )
+        for label, eval_radius in (
+            ("receiver", obs.receiver_radius),
+            ("start", start),
+            ("outer", outer),
+        ):
+            xy_eval = torch.stack(
+                (
+                    torch.as_tensor(float(eval_radius), device=device, dtype=dtype) * torch.cos(sample_angles),
+                    torch.as_tensor(float(eval_radius), device=device, dtype=dtype) * torch.sin(sample_angles),
+                ),
+                dim=1,
+            )
+            envelope = model.field_envelope(xy_eval).detach().cpu().numpy()
+            print(
+                f"B({label}_radius={float(eval_radius):.8g}) "
+                f"min/max/mean={envelope.min():.8f}/{envelope.max():.8f}/{envelope.mean():.8f}",
+                flush=True,
+            )
+    else:
+        print("field_hard_boundary=none", flush=True)
+        print(
+            "radii: "
+            f"receiver_radius={obs.receiver_radius:g} "
+            "field_envelope_start_radius=None "
+            "field_envelope_outer_radius=None "
+            f"domain_radius={domain_radius:g} "
+            f"pde_physical_radius={pde_radius:g}",
+            flush=True,
+        )
     if config.learn_integral_alpha:
         attach_integral_alpha(model, obs_tensors.unique_directions.shape[0], device, dtype)
         print(f"Integral alpha initial: {integral_alpha_summary(model, obs.direction_labels)}", flush=True)
@@ -1811,7 +1958,7 @@ def train_double_branch_pinn_from_observations(
         data_indices, data_xy, data_dirs, _data_amps, data_target = sample_observation_batch(
             obs_tensors, config.data_batch_per_direction
         )
-        pde_xy = sample_collocation_points(config.n_pde, target, radius, device, dtype)
+        pde_xy = sample_collocation_points(config.n_pde, target, pde_radius, device, dtype)
         pde_dirs, pde_amps = sample_direction_batch(
             obs_tensors.unique_directions, obs_tensors.unique_amplitudes, config.n_pde
         )
@@ -1857,6 +2004,8 @@ def train_double_branch_pinn_from_observations(
             "boundary": float(losses["boundary"].detach().cpu()),
             "tv": float(losses["tv"].detach().cpu()),
             "contrast_l1": float(losses["contrast_l1"].detach().cpu()),
+            "eps_binary": float(losses["eps_binary"].detach().cpu()),
+            "eps_high_material": float(losses["eps_high_material"].detach().cpu()),
             "binary_push": float(losses["binary_push"].detach().cpu()),
             "epsilon_binary_sharpen": float(losses["epsilon_binary_sharpen"].detach().cpu()),
             "phase_binary": float(losses["phase_binary"].detach().cpu()),
@@ -1965,7 +2114,7 @@ def train_double_branch_pinn_from_observations(
             data_indices, data_xy, data_dirs, _data_amps, data_target = sample_observation_batch(
                 obs_tensors, config.data_batch_per_direction
             )
-            pde_xy = sample_collocation_points(config.n_pde, target, radius, device, dtype)
+            pde_xy = sample_collocation_points(config.n_pde, target, pde_radius, device, dtype)
             pde_dirs, pde_amps = sample_direction_batch(
                 obs_tensors.unique_directions, obs_tensors.unique_amplitudes, config.n_pde
             )
@@ -2008,6 +2157,8 @@ def train_double_branch_pinn_from_observations(
                         "boundary": float(losses["boundary"].detach().cpu()),
                         "tv": float(losses["tv"].detach().cpu()),
                         "contrast_l1": float(losses["contrast_l1"].detach().cpu()),
+                        "eps_binary": float(losses["eps_binary"].detach().cpu()),
+                        "eps_high_material": float(losses["eps_high_material"].detach().cpu()),
                         "binary_push": float(losses["binary_push"].detach().cpu()),
                         "epsilon_binary_sharpen": float(losses["epsilon_binary_sharpen"].detach().cpu()),
                         "phase_binary": float(losses["phase_binary"].detach().cpu()),
