@@ -77,7 +77,10 @@ class TrainConfig:
     field_lr: Optional[float] = None
     epsilon_lr: Optional[float] = None
     freeze_epsilon_steps: int = 0
+    epsilon_last_layers_only_steps: int = 0
+    epsilon_last_layers_count: int = 0
     freeze_field_branch: bool = False
+    field_parameterization: str = "direct"
     field_hard_boundary: str = "none"
     field_envelope_start_radius: Optional[float] = None
     field_envelope_outer_radius: Optional[float] = None
@@ -462,13 +465,18 @@ class FieldBranch(nn.Module):
         super().__init__()
         self.k0 = config.k0
         self.roi_half_width = roi_half_width
+        self.field_parameterization = config.field_parameterization
         self.spatial_features = FourierFeatureMap(
             input_dim=2,
             num_bands=config.fourier_bands,
             max_frequency=config.fourier_max_frequency,
             include_input=True,
         )
-        input_dim = self.spatial_features.output_dim + 2 + 2
+        if self.field_parameterization not in ("direct", "carrier_envelope"):
+            raise ValueError("field_parameterization must be one of: direct, carrier_envelope")
+        input_dim = self.spatial_features.output_dim + 2
+        if self.field_parameterization == "direct":
+            input_dim += 2
         self.mlp = MLP(
             input_dim=input_dim,
             output_dim=2,
@@ -479,17 +487,11 @@ class FieldBranch(nn.Module):
 
     def forward(self, xy: "torch.Tensor", directions: "torch.Tensor") -> "torch.Tensor":
         xy_scaled = xy / self.roi_half_width
-        phase = self.k0 * torch.sum(xy * directions, dim=1, keepdim=True)
-        features = torch.cat(
-            [
-                self.spatial_features(xy_scaled),
-                directions,
-                torch.sin(phase),
-                torch.cos(phase),
-            ],
-            dim=1,
-        )
-        return self.mlp(features)
+        features = [self.spatial_features(xy_scaled), directions]
+        if self.field_parameterization == "direct":
+            phase = self.k0 * torch.sum(xy * directions, dim=1, keepdim=True)
+            features.extend((torch.sin(phase), torch.cos(phase)))
+        return self.mlp(torch.cat(features, dim=1))
 
 
 class EpsilonBranch(nn.Module):
@@ -608,6 +610,9 @@ class DoubleBranchPINN(nn.Module):
     def __init__(self, config: TrainConfig, target: TargetSpec) -> None:
         super().__init__()
         self.field_branch = FieldBranch(config, target.roi_half_width)
+        self.field_parameterization = config.field_parameterization
+        self.incident_phase_sign = config.incident_phase_sign
+        self.k0 = config.k0
         self.field_hard_boundary = config.field_hard_boundary
         self.field_envelope_start_radius = config.field_envelope_start_radius
         self.field_envelope_outer_radius = config.field_envelope_outer_radius
@@ -622,6 +627,17 @@ class DoubleBranchPINN(nn.Module):
 
     def scattered_field(self, xy: "torch.Tensor", directions: "torch.Tensor") -> "torch.Tensor":
         raw = self.field_branch(xy, directions)
+        if self.field_parameterization == "carrier_envelope":
+            phase = self.incident_phase_sign * self.k0 * torch.sum(xy * directions, dim=1, keepdim=True)
+            cos_phase = torch.cos(phase)
+            sin_phase = torch.sin(phase)
+            raw = torch.cat(
+                (
+                    cos_phase * raw[:, 0:1] - sin_phase * raw[:, 1:2],
+                    sin_phase * raw[:, 0:1] + cos_phase * raw[:, 1:2],
+                ),
+                dim=1,
+            )
         if self.field_hard_boundary == "outer_taper":
             return self.field_envelope(xy) * raw
         return raw
@@ -679,7 +695,14 @@ def load_epsilon_branch_only(
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     checkpoint_model = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     epsilon_state = extract_epsilon_branch_state(checkpoint_model, checkpoint_path)
-    model.epsilon_branch.load_state_dict(epsilon_state)
+    incompatible = model.epsilon_branch.load_state_dict(epsilon_state, strict=False)
+    print(
+        "epsilon checkpoint keys: "
+        f"missing={incompatible.missing_keys} unexpected={incompatible.unexpected_keys}",
+        flush=True,
+    )
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise ValueError(f"Incompatible epsilon_branch checkpoint: {checkpoint_path}")
     print(
         f"epsilon branch loaded from {checkpoint_path} ({len(epsilon_state)} tensors)",
         flush=True,
@@ -750,6 +773,32 @@ def pde_residual_loss(
     xy_req = xy.detach().clone().requires_grad_(True)
     directions = directions.detach()
     amplitudes = amplitudes.detach()
+    if config.field_parameterization == "carrier_envelope":
+        envelope = model.field_branch(xy_req, directions)
+        lap_re, lap_im = laplacian_two_outputs(envelope, xy_req)
+        directional_gradients = []
+        for component in range(2):
+            value = envelope[:, component : component + 1]
+            gradient = torch.autograd.grad(
+                value.sum(), xy_req, create_graph=True, retain_graph=True
+            )[0]
+            directional_gradients.append(torch.sum(gradient * directions, dim=1, keepdim=True))
+        eps = model.epsilon(xy_req)
+        contrast = eps - 1.0
+        cross_scale = 2.0 * config.incident_phase_sign / config.k0
+        lap_re_normalized = lap_re / (config.k0**2)
+        lap_im_normalized = lap_im / (config.k0**2)
+        cross_re = -cross_scale * directional_gradients[1]
+        cross_im = cross_scale * directional_gradients[0]
+        material_re = contrast * (envelope[:, 0:1] + amplitudes[:, 0:1])
+        material_im = contrast * (envelope[:, 1:2] + amplitudes[:, 1:2])
+        terms = (lap_re_normalized, lap_im_normalized, cross_re, cross_im, material_re, material_im)
+        if not all(bool(torch.isfinite(term).all()) for term in terms):
+            raise FloatingPointError("carrier-envelope PDE contains non-finite laplacian, transport, or material terms.")
+        res_re = lap_re_normalized + cross_re + material_re
+        res_im = lap_im_normalized + cross_im + material_im
+        return torch.mean(res_re.square() + res_im.square())
+
     scattered = model.scattered_field(xy_req, directions)
     lap_re, lap_im = laplacian_two_outputs(scattered, xy_req)
     eps = model.epsilon(xy_req)
@@ -1747,6 +1796,7 @@ def train_double_branch_pinn_from_observations(
     pde_radius = config.pde_physical_radius or domain_radius
 
     model = DoubleBranchPINN(config, target).to(device=device, dtype=dtype)
+    print(f"field_parameterization={config.field_parameterization}", flush=True)
     if config.field_hard_boundary not in ("none", "outer_taper"):
         raise ValueError("field_hard_boundary must be one of: none, outer_taper")
     if config.field_hard_boundary == "outer_taper":
@@ -1817,7 +1867,28 @@ def train_double_branch_pinn_from_observations(
     if config.resume_checkpoint:
         checkpoint = torch.load(config.resume_checkpoint, map_location=device, weights_only=False)
         checkpoint_model = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
-        model.load_state_dict(checkpoint_model, strict=not config.learn_integral_alpha)
+        checkpoint_config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+        checkpoint_field_parameterization = checkpoint_config.get("field_parameterization", "direct")
+        if (
+            config.field_parameterization == "carrier_envelope"
+            and checkpoint_field_parameterization != "carrier_envelope"
+        ):
+            epsilon_state = extract_epsilon_branch_state(checkpoint_model, config.resume_checkpoint)
+            incompatible = model.epsilon_branch.load_state_dict(epsilon_state, strict=False)
+            print(
+                "carrier_envelope continuation: skipped incompatible direct field_branch; "
+                "loaded epsilon_branch only",
+                flush=True,
+            )
+            print(
+                "epsilon checkpoint keys: "
+                f"missing={incompatible.missing_keys} unexpected={incompatible.unexpected_keys}",
+                flush=True,
+            )
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                raise ValueError(f"Incompatible epsilon_branch checkpoint: {config.resume_checkpoint}")
+        else:
+            model.load_state_dict(checkpoint_model, strict=not config.learn_integral_alpha)
         if isinstance(checkpoint, dict):
             resume_step = int(checkpoint.get("step", 0) or 0)
         print(f"Loaded checkpoint: {config.resume_checkpoint}", flush=True)
@@ -1903,26 +1974,61 @@ def train_double_branch_pinn_from_observations(
         config.field_lr is not None
         or config.epsilon_lr is not None
         or config.freeze_epsilon_steps > 0
+        or config.epsilon_last_layers_only_steps > 0
         or config.freeze_field_branch
     )
+    epsilon_last_params: List["torch.nn.Parameter"] = []
+    epsilon_other_params: List["torch.nn.Parameter"] = []
+    use_partial_epsilon_schedule = config.epsilon_last_layers_only_steps > 0
+    if use_partial_epsilon_schedule:
+        if config.epsilon_last_layers_count <= 0:
+            raise ValueError("epsilon_last_layers_count must be positive when partial epsilon unfreezing is enabled.")
+        linear_layers = [module for module in model.epsilon_branch.modules() if isinstance(module, nn.Linear)]
+        if len(linear_layers) < config.epsilon_last_layers_count:
+            raise ValueError("epsilon_last_layers_count exceeds the available epsilon MLP linear layers.")
+        last_parameter_ids = {
+            id(parameter)
+            for layer in linear_layers[-config.epsilon_last_layers_count :]
+            for parameter in layer.parameters()
+        }
+        epsilon_last_params = [
+            parameter for parameter in model.epsilon_branch.parameters() if id(parameter) in last_parameter_ids
+        ]
+        epsilon_other_params = [
+            parameter for parameter in model.epsilon_branch.parameters() if id(parameter) not in last_parameter_ids
+        ]
     if use_split_lrs:
         field_base_lr = 0.0 if config.freeze_field_branch else (
             config.field_lr if config.field_lr is not None else config.learning_rate
         )
         epsilon_base_lr = config.epsilon_lr if config.epsilon_lr is not None else config.learning_rate
         field_params = [p for p in model.field_branch.parameters() if p.requires_grad]
-        optimizer_adam = torch.optim.Adam(
-            [
-                {"params": field_params, "lr": field_base_lr, "name": "field"},
-                {"params": model.epsilon_branch.parameters(), "lr": epsilon_base_lr, "name": "epsilon"},
-            ]
-        )
+        optimizer_groups = [{"params": field_params, "lr": field_base_lr, "name": "field"}]
+        if use_partial_epsilon_schedule:
+            optimizer_groups.extend(
+                [
+                    {"params": epsilon_last_params, "lr": epsilon_base_lr, "name": "epsilon_last"},
+                    {"params": epsilon_other_params, "lr": 0.0, "name": "epsilon_other"},
+                ]
+            )
+        else:
+            optimizer_groups.append(
+                {"params": model.epsilon_branch.parameters(), "lr": epsilon_base_lr, "name": "epsilon"}
+            )
+        optimizer_adam = torch.optim.Adam(optimizer_groups)
         scheduler = None
         print(
             f"Using split Adam learning rates: field_lr={field_base_lr:g}, "
             f"epsilon_lr={epsilon_base_lr:g}, freeze_epsilon_steps={config.freeze_epsilon_steps}",
             flush=True,
         )
+        if use_partial_epsilon_schedule:
+            print(
+                "Partial epsilon unfreezing: "
+                f"last_linear_layers={config.epsilon_last_layers_count} "
+                f"for_steps={config.epsilon_last_layers_only_steps}",
+                flush=True,
+            )
     else:
         optimizer_adam = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1940,10 +2046,23 @@ def train_double_branch_pinn_from_observations(
                 config.field_lr if config.field_lr is not None else config.learning_rate
             )
             epsilon_base_lr = config.epsilon_lr if config.epsilon_lr is not None else config.learning_rate
-            remaining_eps_steps = max(config.epochs_adam - config.freeze_epsilon_steps, 1)
+            field_lr = cosine_lr(field_base_lr, step - 1, config.epochs_adam)
+            if use_partial_epsilon_schedule:
+                epsilon_ratio = epsilon_base_lr / field_base_lr if field_base_lr > 0.0 else 0.0
+                epsilon_lr = epsilon_ratio * field_lr
+                partial_end = config.freeze_epsilon_steps + config.epsilon_last_layers_only_steps
+            else:
+                remaining_eps_steps = max(config.epochs_adam - config.freeze_epsilon_steps, 1)
             for group in optimizer_adam.param_groups:
                 if group.get("name") == "field":
-                    group["lr"] = cosine_lr(field_base_lr, step - 1, config.epochs_adam)
+                    group["lr"] = field_lr
+                elif use_partial_epsilon_schedule:
+                    if step <= config.freeze_epsilon_steps:
+                        group["lr"] = 0.0
+                    elif step <= partial_end:
+                        group["lr"] = epsilon_lr if group.get("name") == "epsilon_last" else 0.0
+                    else:
+                        group["lr"] = epsilon_lr
                 elif step <= config.freeze_epsilon_steps:
                     group["lr"] = 0.0
                 else:

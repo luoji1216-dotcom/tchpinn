@@ -60,6 +60,24 @@ def build_square_parser(description: str) -> argparse.ArgumentParser:
         default=0,
         help="Keep epsilon_branch Adam learning rate at zero for this many initial steps.",
     )
+    parser.add_argument(
+        "--epsilon-last-layers-only-steps",
+        type=int,
+        default=0,
+        help="After the epsilon freeze, train only the final epsilon MLP linear layers for this many steps.",
+    )
+    parser.add_argument(
+        "--epsilon-last-layers-count",
+        type=int,
+        default=0,
+        help="Number of final epsilon MLP linear layers enabled during the partial-unfreeze phase.",
+    )
+    parser.add_argument(
+        "--field-parameterization",
+        choices=["direct", "carrier_envelope"],
+        default="direct",
+        help="Field MLP output: direct scattered field or a plane-wave carrier envelope.",
+    )
     parser.add_argument("--field-hard-boundary", choices=["none", "outer_taper"], default="none")
     parser.add_argument("--field-envelope-start-radius", type=float, default=None)
     parser.add_argument("--field-envelope-outer-radius", type=float, default=None)
@@ -247,6 +265,9 @@ def run_square_case(
         field_lr=args.field_lr,
         epsilon_lr=args.epsilon_lr,
         freeze_epsilon_steps=args.freeze_epsilon_steps,
+        epsilon_last_layers_only_steps=args.epsilon_last_layers_only_steps,
+        epsilon_last_layers_count=args.epsilon_last_layers_count,
+        field_parameterization=args.field_parameterization,
         field_hard_boundary=args.field_hard_boundary,
         field_envelope_start_radius=args.field_envelope_start_radius,
         field_envelope_outer_radius=args.field_envelope_outer_radius,

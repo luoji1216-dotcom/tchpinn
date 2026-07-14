@@ -22,6 +22,14 @@ square_target/**/results*/
 square_target/*.pt
 square_target/*.pth
 square_target/*.npy
+square_target/data_3GHz/
+square_target/diag_square_3GHz_*/
+square_rezult/
+austria_rezult/
+rezult/
+austria_target/data_1GHz/
+austria_target/data_1GHz_*/
+austria_target/cst_observation_curve_check.png
 *_results/
 *.rar
 .idea/

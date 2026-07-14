@@ -1,5 +1,41 @@
 # CODEX Handoff
 
+## Square 3GHz Four-Direction Carrier-Envelope Archive
+
+- Four-direction carrier-envelope support is implemented in
+  `square_target/pinn_pixel_inverse_core.py` and exposed by
+  `square_target/square_case_common.py` through
+  `--field-parameterization direct|carrier_envelope`.
+- Direct mode retains the existing scattered-field MLP path. Carrier mode uses
+  `Es = exp(i * incident_phase_sign * k0 * d.r) * U` and the normalized
+  envelope PDE. Direct-to-carrier continuation loads only the compatible
+  epsilon branch when the field parameterizations differ.
+- Four-direction entry point:
+  `square_target/run_5_3_2_square_3ghz_fourdir_pinn.py` with
+  `+x/-x/+y/-y`. The two-direction entry remains `run_5_3_2_square_3ghz_pinn.py`.
+- Carrier PDE calibration uses `weight_pde=2000`; the direct PDE residual has
+  a different scale and retains its original `weight_pde=0.0002`.
+- Best carrier result is the initial four-direction 3000-step continuation:
+  - checkpoint:
+    `square_target/data_3GHz/results_5_3_2_square_3GHz_fourdir_carrier_from_directeps_freeze1k_joint2k/model_final.pt`
+  - initialize epsilon from the four-direction direct checkpoint, reinitialize
+    the carrier field, freeze epsilon for 1000 steps, then jointly train 2000.
+  - continuous RE/SSIM: `0.364978 / 0.737389`
+  - thresholded RE/SSIM: `0.453354 / 0.653491`
+  - square mean/max: `2.660631 / 4.620285`; background mean: `1.119809`.
+- A continuation through global step 14000 did not improve the carrier result.
+  It lowered raw field/PDE/boundary losses while reducing square mean and
+  degrading structure. The common checkpoint table is:
+  `square_target/data_3GHz/results_5_3_2_square_3GHz_fourdir_carrier_from_directeps_freeze1k_joint2k_continue_to14k/checkpoint_evaluation_summary.csv`.
+- Fixed-state diagnostics at the 3000-step carrier checkpoint show persistent
+  field-epsilon compensation: with true epsilon fixed, field refit reached
+  integral loss about `2.0e-3`, versus about `9.6e-4` for the low-amplitude
+  joint solution. With carrier field frozen, epsilon did not fill the square;
+  its integral-data epsilon-gradient square/background ratio was about `0.224`.
+- Do not treat longer carrier training as an amplitude-recovery method. The
+  archived four-direction carrier result is informative but remains below the
+  existing 0.3GHz-to-3GHz continuation best listed below.
+
 ## Square 3GHz Continuation
 
 - Current best result: `B prior=3e-4 at 12000`
