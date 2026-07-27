@@ -42,6 +42,17 @@ REPO_ROOT = HERE.parent
 DEFAULT_CONFIG = HERE / "formal_config.json"
 DEFAULT_DATA = REPO_ROOT.parent / "data_austra" / "0.3GHz_six_direction"
 DEFAULT_OUTPUT = HERE / "results_cst_j_epsilon_discrete_pde_inversion"
+FORMAL_DIRECTIONS = np.asarray(
+    (
+        (1.0, 0.0),
+        (-1.0, 0.0),
+        (0.0, 1.0),
+        (0.0, -1.0),
+        (1.0 / math.sqrt(2.0), 1.0 / math.sqrt(2.0)),
+        (-1.0 / math.sqrt(2.0), -1.0 / math.sqrt(2.0)),
+    ),
+    dtype=np.float64,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,8 +105,21 @@ def load_formal_data(data_dir: Path, payload: dict, train_config: object):
         float(np.max(np.linalg.norm(xy - receiver_xy, axis=1)))
         for xy in xy_views
     )
-    if mismatch > 1.0e-10:
+    if mismatch > float(payload["receiver_coordinate_tolerance_m"]):
         raise RuntimeError(f"cross-view receiver mismatch: {mismatch}")
+    if not np.allclose(
+        np.asarray(directions, dtype=np.float64),
+        FORMAL_DIRECTIONS,
+        rtol=0.0,
+        atol=1.0e-12,
+    ):
+        raise RuntimeError(
+            "formal six-direction vectors differ from the validated order"
+        )
+    if measured_views[0].shape[0] != 836:
+        raise RuntimeError(
+            f"formal CST smoke expects 836 points/view, got {counts}"
+        )
     return (
         np.asarray(measured_views, dtype=np.complex128),
         receiver_xy,
@@ -122,23 +146,30 @@ def fit_bp_initialization(
     direction_all: torch.Tensor,
     target: torch.Tensor,
     steps: int,
+    tolerance: float,
     clip_norm: float,
 ) -> float:
     parameters = set_branch_trainable(model, "J")
     optimizer = torch.optim.Adam(parameters, lr=1.0e-3)
+    error = math.inf
     for _ in range(steps):
         optimizer.zero_grad(set_to_none=True)
         prediction = model.current(xy_all, direction_all)
-        loss = torch.mean(torch.abs(prediction - target).square())
+        # Match the outer raw Re/Im mean-square loss exactly.  The complex
+        # form has two components, so it carries a compensating one-half.
+        loss = 0.5 * torch.mean(torch.abs(prediction - target).square())
         loss.backward()
         torch.nn.utils.clip_grad_norm_(parameters, clip_norm)
         optimizer.step()
-    with torch.no_grad():
-        prediction = model.current(xy_all, direction_all)
-        return float(
-            torch.linalg.vector_norm(prediction - target)
-            / torch.linalg.vector_norm(target).clamp_min(1.0e-30)
-        )
+        with torch.no_grad():
+            prediction = model.current(xy_all, direction_all)
+            error = float(
+                torch.linalg.vector_norm(prediction - target)
+                / torch.linalg.vector_norm(target).clamp_min(1.0e-30)
+            )
+        if error < tolerance:
+            break
+    return error
 
 
 def write_history(output_dir: Path, history: list[Dict[str, float]]) -> None:
@@ -235,10 +266,13 @@ def main() -> None:
         direction_all,
         bp_target,
         payload["initial_j_fit_steps"],
+        payload["initial_j_fit_tolerance"],
         payload["gradient_clip_norm"],
     )
     epsilon_final = model.epsilon_mlp.net[-1]
-    initial_fraction = (payload["epsilon_initial"] - 1.0) / 3.0
+    initial_fraction = (
+        payload["epsilon_initial"] - payload["epsilon_min"]
+    ) / (payload["epsilon_max"] - payload["epsilon_min"])
     initial_bias = math.log(initial_fraction / (1.0 - initial_fraction))
     with torch.no_grad():
         epsilon_final.weight.zero_()
@@ -270,9 +304,9 @@ def main() -> None:
             k0,
         )
         (
-            j_terms["data_loss"]
-            + j_terms["state_loss"]
-            + j_terms["pde_loss"]
+            payload["weight_data"] * j_terms["data_loss"]
+            + payload["weight_state"] * j_terms["state_loss"]
+            + payload["weight_pde"] * j_terms["pde_loss"]
         ).backward()
         torch.nn.utils.clip_grad_norm_(
             j_parameters, payload["gradient_clip_norm"]
@@ -296,8 +330,8 @@ def main() -> None:
             k0,
         )
         (
-            epsilon_terms["state_loss"]
-            + epsilon_terms["pde_loss"]
+            payload["weight_state"] * epsilon_terms["state_loss"]
+            + payload["weight_pde"] * epsilon_terms["pde_loss"]
             + payload["tv_edge_weight"] * tv_edge_loss(epsilon)
         ).backward()
         torch.nn.utils.clip_grad_norm_(

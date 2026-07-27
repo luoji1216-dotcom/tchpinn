@@ -67,6 +67,8 @@ class JEpsilonNetwork(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.roi_half_width = float(roi_half_width)
+        self.eps_min = float(config.eps_min)
+        self.eps_max = float(config.eps_max)
         self.j_branch = inverse_core.FieldBranch(config, roi_half_width)
         j_final = self.j_branch.mlp.net[-1]
         if not isinstance(j_final, torch.nn.Linear):
@@ -112,7 +114,7 @@ class JEpsilonNetwork(torch.nn.Module):
         raw = self.epsilon_mlp(
             self.epsilon_features(xy / self.roi_half_width)
         )
-        return 1.0 + 3.0 * torch.sigmoid(raw)
+        return self.eps_min + (self.eps_max - self.eps_min) * torch.sigmoid(raw)
 
 
 def branch_parameters(

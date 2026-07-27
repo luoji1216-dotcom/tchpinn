@@ -25,6 +25,7 @@
   "fourier_max_frequency": 8.0,
   "gradient_clip_norm": 1.0,
   "initial_j_fit_steps": 3000,
+  "initial_j_fit_tolerance": 0.001,
   "alternating_steps": 30000,
   "learning_rate_j": 0.0001,
   "learning_rate_epsilon": 0.001,
@@ -32,5 +33,9 @@
   "contrast_sparsity_weight": 0.0,
   "log_every": 50,
   "checkpoint_every": 500,
+  "receiver_coordinate_tolerance_m": 1.0e-8,
+  "weight_data": 1.0,
+  "weight_state": 1.0,
+  "weight_pde": 1.0,
   "seed": 20260726
 }
